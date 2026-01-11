@@ -1,6 +1,7 @@
 
+
 import { GoogleGenAI, Type, Modality, Schema } from "@google/genai";
-import { Channel, StrategyResult, StructureResult, ScriptResult, PacingResult, TitleResult, Chapter, TitleSelectionResult, ScenePlanResult, TitleVariant, AgentResult, DurationConfig, AdminPlannerResult, ProductionLine, MusicTrack, MusicDirectorResult } from "../types";
+import { Channel, StrategyResult, StructureResult, ScriptResult, PacingResult, TitleResult, Chapter, TitleSelectionResult, ScenePlanResult, TitleVariant, AgentResult, DurationConfig, AdminPlannerResult, ProductionLine, MusicTrack, MusicDirectorResult, AnalystResult } from "../types";
 
 // Helper to safely get API key (Prioritize passed key, then env)
 const getApiKey = (overriddenKey?: string): string => {
@@ -141,7 +142,7 @@ interface GenerationConfig {
 const generateStructuredContent = async <T>(
   prompt: string,
   config: GenerationConfig,
-  modelName: string = "gemini-2.5-flash", 
+  modelName: string = "gemini-3-flash-preview", // Default baseline
   apiKeyOverride?: string
 ): Promise<{ data: T; usage: { prompt: number; candidates: number; total: number } }> => {
   const apiKey = getApiKey(apiKeyOverride);
@@ -228,6 +229,81 @@ function writeString(view: DataView, offset: number, string: string) {
     view.setUint8(offset + i, string.charCodeAt(i));
   }
 }
+
+// --- NEW: Analyst Agent (Data Analysis & Strategy) ---
+
+export const runAnalystAgent = async (
+    channel: Channel,
+    analyticsData: any, // Views, trends, last video performance
+    count: number,
+    apiKey?: string
+): Promise<{ data: AnalystResult; usage: any }> => {
+    
+    // UPGRADE: Using 'gemini-3-pro-preview' for advanced reasoning and data analysis
+    const model = 'gemini-3-pro-preview';
+
+    const systemInstruction = `أنت AnalystAgent، محلل بيانات خبير لقنوات اليوتيوب.
+مهمتك:
+1. تحليل أداء القناة والجمهور.
+2. اقتراح مواضيع جديدة عالية الأداء (Viral Topics) بناءً على التحليل.
+3. مراقبة تأثير الفيديوهات السابقة (Feedback Loop).
+
+قواعد:
+- حلل البيانات المقدمة بدقة.
+- اقترح مواضيع تهم الجمهور الحالي وتجذب جمهوراً جديداً.
+- التزم بنغمة القناة (${channel.tone}).
+- المخرجات JSON فقط.`;
+
+    const prompt = `
+بيانات القناة الحالية:
+- الاسم: ${channel.name}
+- الوصف: ${channel.audienceDescription}
+- النيتش: ${channel.niche}
+- أداء آخر فيديوهات: ${JSON.stringify(analyticsData.recentVideos || [])}
+- الترندات الحالية: ${JSON.stringify(analyticsData.trends || ['General Trends'])}
+
+المطلوب:
+1. ملخص التحليل.
+2. تقييم الأداء.
+3. اقتراح ${count} مواضيع جذابة جداً (Killer Topics).
+
+صيغة JSON:
+{
+  "analysis_summary": "...",
+  "identified_trends": ["..."],
+  "performance_verdict": "Growing | Stable | Declining",
+  "suggested_topics": [
+    {
+      "topic": "...",
+      "reasoning": "...",
+      "predicted_performance": "High"
+    }
+  ]
+}`;
+
+    const schema: Schema = {
+        type: Type.OBJECT,
+        properties: {
+            analysis_summary: { type: Type.STRING },
+            identified_trends: { type: Type.ARRAY, items: { type: Type.STRING } },
+            performance_verdict: { type: Type.STRING },
+            suggested_topics: {
+                type: Type.ARRAY,
+                items: {
+                    type: Type.OBJECT,
+                    properties: {
+                        topic: { type: Type.STRING },
+                        reasoning: { type: Type.STRING },
+                        predicted_performance: { type: Type.STRING }
+                    }
+                }
+            }
+        },
+        required: ["analysis_summary", "suggested_topics"]
+    };
+
+    return generateStructuredContent<AnalystResult>(prompt, { temperature: 0.7, systemInstruction, schema, maxTokens: 4000 }, model, apiKey);
+};
 
 // --- Music Director Agent ---
 
@@ -358,7 +434,7 @@ export const runMusicDirectorAgent = async (
         required: ["decision", "selected", "mixing", "notes"]
     };
 
-    return generateStructuredContent<MusicDirectorResult>(prompt, { temperature: 0.5, systemInstruction, schema, maxTokens: 2000 }, undefined, apiKey);
+    return generateStructuredContent<MusicDirectorResult>(prompt, { temperature: 0.5, systemInstruction, schema, maxTokens: 2000 }, "gemini-3-flash-preview", apiKey);
 };
 
 // --- 0. Admin Planner Agent (Management: 0.8) ---
@@ -451,7 +527,8 @@ export const runAdminPlannerAgent = async (
         required: ["date", "timezone", "target_channel_id", "items"]
     };
 
-    return generateStructuredContent<AdminPlannerResult>(prompt, { temperature: 0.8, systemInstruction, schema, maxTokens: 4000 }, undefined, apiKey);
+    // Use Flash for speed in admin tasks
+    return generateStructuredContent<AdminPlannerResult>(prompt, { temperature: 0.8, systemInstruction, schema, maxTokens: 4000 }, "gemini-3-flash-preview", apiKey);
 };
 
 
@@ -464,6 +541,9 @@ export const runStrategyAgent = async (
   apiKey?: string
 ): Promise<{ data: StrategyResult; usage: any }> => {
   
+  // UPGRADE: Using 'gemini-3-pro-preview' for creative strategy
+  const model = 'gemini-3-pro-preview';
+
   // Backwards compatibility for min/max
   const targetMin = options.duration.target_minutes || Math.ceil(options.duration.target_value / 60) || 5;
 
@@ -504,7 +584,7 @@ Required JSON Output: Idea, Angle, Hooks (array), Promise, Outline (array of 5-8
   };
 
   // Optimization: Increased to 8192 for deep outlines
-  return generateStructuredContent<StrategyResult>(prompt, { temperature: 0.7, systemInstruction, schema, maxTokens: 8192 }, undefined, apiKey);
+  return generateStructuredContent<StrategyResult>(prompt, { temperature: 0.7, systemInstruction, schema, maxTokens: 8192 }, model, apiKey);
 };
 
 // --- 1.5 SHORTS: Hook Maker Agent (Highly Creative: 0.9) ---
@@ -515,6 +595,9 @@ export const runHookMakerAgent = async (
     apiKey?: string
 ): Promise<{ data: StrategyResult; usage: any }> => {
     
+    // Use Pro for high quality hooks
+    const model = 'gemini-3-pro-preview';
+
     const styleGuard = `STYLE LOCK: Channel Tone: "${channel.tone}". Language: "${channel.language}".`;
     
     const systemInstruction = `You are a HookMaker for Viral Shorts.
@@ -541,7 +624,7 @@ export const runHookMakerAgent = async (
       required: ["idea", "angle", "hooks", "promise", "outline"]
     };
   
-    return generateStructuredContent<StrategyResult>(prompt, { temperature: 0.9, systemInstruction, schema, maxTokens: 2000 }, undefined, apiKey);
+    return generateStructuredContent<StrategyResult>(prompt, { temperature: 0.9, systemInstruction, schema, maxTokens: 2000 }, model, apiKey);
 };
 
 // --- 2. Structure Agent (Planning: 0.5) ---
@@ -581,7 +664,7 @@ Rules:
   };
 
   // Optimization: Increased to 4000
-  return generateStructuredContent<StructureResult>(prompt, { temperature: 0.5, systemInstruction, schema, maxTokens: 4000 }, undefined, apiKey);
+  return generateStructuredContent<StructureResult>(prompt, { temperature: 0.5, systemInstruction, schema, maxTokens: 4000 }, "gemini-3-flash-preview", apiKey);
 };
 
 // --- 3. Script Builder Agent (Creative: 0.7) ---
@@ -592,6 +675,9 @@ export const runScriptBuilderAgent = async (
     apiKey?: string
 ): Promise<{ data: ScriptResult; usage: any }> => {
   
+  // UPGRADE: Scripting requires the best model
+  const model = 'gemini-3-pro-preview';
+
   const styleGuard = `STYLE LOCK: Tone: ${channel.tone}. Language: ${channel.language}.`;
   
   const systemInstruction = `You are a ScriptBuilder.
@@ -624,7 +710,7 @@ Rules:
   };
 
   // Optimization: INCREASED to 8192 to prevent 'Unterminated string' errors on long scripts
-  return generateStructuredContent<ScriptResult>(prompt, { temperature: 0.7, systemInstruction, schema, maxTokens: 8192 }, undefined, apiKey);
+  return generateStructuredContent<ScriptResult>(prompt, { temperature: 0.7, systemInstruction, schema, maxTokens: 8192 }, model, apiKey);
 };
 
 // --- 3.5 SHORTS: MicroScript Builder (Strict: 0.4) ---
@@ -671,7 +757,7 @@ export const runMicroScriptBuilderAgent = async (
         }
     };
 
-    return generateStructuredContent<ScriptResult>(prompt, { temperature: 0.7, systemInstruction, schema, maxTokens: 2000 }, undefined, apiKey);
+    return generateStructuredContent<ScriptResult>(prompt, { temperature: 0.7, systemInstruction, schema, maxTokens: 2000 }, "gemini-3-pro-preview", apiKey);
 };
 
 // --- 4. Pacing Reviewer Agent (Decision/QC: 0.2) ---
@@ -693,7 +779,7 @@ Output JSON only.
     }
   };
 
-  return generateStructuredContent<PacingResult>(prompt, { temperature: 0.2, systemInstruction, schema, maxTokens: 8192 }, undefined, apiKey);
+  return generateStructuredContent<PacingResult>(prompt, { temperature: 0.2, systemInstruction, schema, maxTokens: 8192 }, "gemini-3-flash-preview", apiKey);
 };
 
 // --- 5. Title Generator Agent (Creative: 0.7) ---
@@ -726,7 +812,7 @@ Rules:
   };
 
   // Increased to 2000 to prevent 'Unterminated string' on arrays
-  return generateStructuredContent<TitleResult>(prompt, { temperature: 0.7, systemInstruction, schema, maxTokens: 2000 }, undefined, apiKey);
+  return generateStructuredContent<TitleResult>(prompt, { temperature: 0.7, systemInstruction, schema, maxTokens: 2000 }, "gemini-3-flash-preview", apiKey);
 };
 
 // --- 6. Title Selector Agent (Decision: 0.2) ---
@@ -749,7 +835,7 @@ Pick the best one for YouTube.`;
   };
 
   // Increased tokens to 2000 to prevent early cut-off of reasoning
-  return generateStructuredContent<TitleSelectionResult>(prompt, { temperature: 0.2, systemInstruction, schema, maxTokens: 2000 }, undefined, apiKey);
+  return generateStructuredContent<TitleSelectionResult>(prompt, { temperature: 0.2, systemInstruction, schema, maxTokens: 2000 }, "gemini-3-flash-preview", apiKey);
 };
 
 // --- 7. Scene Planner Agent (Planning: 0.5) ---
@@ -788,7 +874,7 @@ Rules:
   };
 
   // Optimization: Increased to 8192! This is critical for generating long lists of scenes without truncation.
-  return generateStructuredContent<ScenePlanResult>(prompt, { temperature: 0.5, systemInstruction, schema, maxTokens: 8192 }, undefined, apiKey);
+  return generateStructuredContent<ScenePlanResult>(prompt, { temperature: 0.5, systemInstruction, schema, maxTokens: 8192 }, "gemini-3-flash-preview", apiKey);
 };
 
 // --- Content Generation ---

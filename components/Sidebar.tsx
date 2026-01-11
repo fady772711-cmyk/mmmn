@@ -1,5 +1,6 @@
+
 import React from 'react';
-import { LayoutDashboard, Radio, Workflow, Film, BarChart3, Settings, Mic2, Server, Bot, UploadCloud, Youtube, PlaySquare } from 'lucide-react';
+import { LayoutDashboard, Radio, Workflow, Film, BarChart3, Settings, Mic2, Server, Bot, UploadCloud, Youtube, PlaySquare, Music, BrainCircuit, ShieldCheck } from 'lucide-react';
 
 interface SidebarProps {
   activeTab: string;
@@ -11,13 +12,14 @@ const Sidebar: React.FC<SidebarProps> = ({ activeTab, setActiveTab }) => {
     { id: 'dashboard', label: 'لوحة التحكم', icon: LayoutDashboard },
     { id: 'channels', label: 'القنوات', icon: Radio },
     { id: 'production', label: 'خط الإنتاج', icon: Film },
-    { id: 'library', label: 'مكتبة الفيديوهات', icon: PlaySquare }, // New Item
+    { id: 'library', label: 'مكتبة الفيديوهات', icon: PlaySquare },
     { id: 'automations', label: 'الأتمتة والجدولة', icon: Workflow },
   ];
 
   const infrastructureItems = [
     { id: 'providers', label: 'المزودات (APIs)', icon: Server },
     { id: 'voices', label: 'مكتبة الأصوات', icon: Mic2 },
+    { id: 'music', label: 'مكتبة الموسيقى', icon: Music },
     { id: 'agents', label: 'الوكلاء', icon: Bot },
     { id: 'publishing', label: 'النشر (YouTube)', icon: UploadCloud },
     { id: 'youtube_connect', label: 'ربط يوتيوب (OAuth)', icon: Youtube },
@@ -67,6 +69,8 @@ const Sidebar: React.FC<SidebarProps> = ({ activeTab, setActiveTab }) => {
         <div>
           <p className="px-4 text-xs font-bold text-slate-600 uppercase tracking-wider mb-2">النظام</p>
           <nav className="space-y-1">
+             {renderItem({ id: 'admin_arabic', label: 'المشرف الإداري', icon: ShieldCheck })}
+             {renderItem({ id: 'admin_agent', label: 'وكيل النظام (Legacy)', icon: BrainCircuit })} 
              {renderItem({ id: 'analytics', label: 'التحليلات', icon: BarChart3 })}
              {renderItem({ id: 'settings', label: 'الإعدادات', icon: Settings })}
           </nav>

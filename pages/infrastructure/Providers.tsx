@@ -1,8 +1,10 @@
+
 import React, { useEffect, useState } from 'react';
 import { ProviderConfig, ProviderType } from '../../types';
 import { db } from '../../services/storageService';
-import { CheckCircle2, AlertCircle, RefreshCw, Eye, EyeOff, Save } from 'lucide-react';
+import { CheckCircle2, AlertCircle, RefreshCw, Eye, EyeOff, Save, Key } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
+import { generateOpenAIContent } from '../../services/openaiService';
 
 const Providers: React.FC = () => {
   const [providers, setProviders] = useState<ProviderConfig[]>([]);
@@ -27,7 +29,7 @@ const Providers: React.FC = () => {
 
   const saveProvider = async (provider: ProviderConfig) => {
     await db.saveProvider(provider);
-    // Show toast or feedback
+    alert(`تم حفظ مفتاح ${provider.name} بنجاح`);
   };
 
   const testConnection = async (provider: ProviderConfig) => {
@@ -40,17 +42,28 @@ const Providers: React.FC = () => {
          const ai = new GoogleGenAI({ apiKey: provider.apiKey });
          // Simple test using a valid model
          await ai.models.generateContent({
-             model: 'gemini-2.0-flash', 
+             model: 'gemini-2.5-flash', 
              contents: 'Test connection'
          });
          status = 'operational';
+      } else if (provider.providerId === 'openai') {
+          if (!provider.apiKey) throw new Error("Missing Key");
+          // Simple test call to OpenAI
+          await generateOpenAIContent(
+              provider.apiKey, 
+              'gpt-4o', 
+              'Say "Test passed" in JSON: {"status": "ok"}', 
+              'You are a test bot.'
+          );
+          status = 'operational';
       } else {
         // Mock test for others
         await new Promise(r => setTimeout(r, 1000));
         status = 'operational';
       }
-    } catch (e) {
+    } catch (e: any) {
       console.error(e);
+      alert("Test Failed: " + e.message);
       status = 'error';
     }
 
@@ -65,7 +78,7 @@ const Providers: React.FC = () => {
       <div className="flex justify-between items-center">
         <div>
           <h2 className="text-2xl font-bold text-white">إدارة المزودات (Providers)</h2>
-          <p className="text-slate-400">ربط مفاتيح API للذكاء الاصطناعي والخدمات الخارجية</p>
+          <p className="text-slate-400">ربط مفاتيح API للذكاء الاصطناعي (Gemini, OpenAI)</p>
         </div>
       </div>
 
@@ -87,8 +100,15 @@ const Providers: React.FC = () => {
                 {providers.map(provider => (
                 <tr key={provider.id} className="hover:bg-slate-800/30 transition">
                     <td className="p-4">
-                        <div className="font-bold text-slate-200">{provider.name}</div>
-                        <div className="text-xs text-slate-500">{provider.providerId}</div>
+                        <div className="flex items-center gap-3">
+                            <div className={`p-2 rounded-lg ${provider.providerId === 'openai' ? 'bg-green-900/20 text-green-500' : 'bg-blue-900/20 text-blue-500'}`}>
+                                <Key size={18} />
+                            </div>
+                            <div>
+                                <div className="font-bold text-slate-200">{provider.name}</div>
+                                <div className="text-xs text-slate-500">{provider.providerId}</div>
+                            </div>
+                        </div>
                     </td>
                     <td className="p-4">
                         <span className="px-2 py-1 rounded bg-slate-800 text-xs text-slate-400 border border-slate-700">

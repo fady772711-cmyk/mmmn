@@ -1,5 +1,5 @@
 
-import { Channel, ProviderConfig, VoicePreset, ProductionRun, AutomationConfig, DailyPlan, ProviderType, YouTubeAuthConfig, ProductionJob, SceneDefinition } from '../types';
+import { Channel, ProviderConfig, VoicePreset, ProductionRun, AutomationConfig, DailyPlan, ProviderType, YouTubeAuthConfig, ProductionJob, SceneDefinition, AgentConfiguration, AgentRole, AuthSettings, AppSettings, AdminJob, DevelopmentTicket, AgentMetrics } from '../types';
 import { MOCK_CHANNELS, MOCK_JOBS } from './mockData';
 
 // Keys for localStorage
@@ -8,16 +8,40 @@ const KEYS = {
   PROVIDERS: 'av_providers',
   VOICES: 'av_voices',
   AGENTS: 'av_agents',
+  AGENT_CONFIGS: 'av_agent_configs',
   RUNS: 'av_runs',
-  AUTOMATIONS: 'av_automations_v2', // Changed key to avoid conflict with legacy
+  AUTOMATIONS: 'av_automations_v2', 
   PLANS: 'av_daily_plans',
   YT_CONFIG: 'av_yt_config',
-  GLOBAL_USAGE: 'av_global_usage'
+  GLOBAL_USAGE: 'av_global_usage',
+  AUTH_SETTINGS: 'av_auth_settings',
+  APP_SETTINGS: 'av_app_settings',
+  ADMIN_JOBS: 'av_admin_jobs',
+  DEV_TICKETS: 'av_dev_tickets',
+  METRICS: 'av_metrics' // New Key for KPI
 };
 
 // Initial Seed Data (If DB is empty)
 const SEED_PROVIDERS: ProviderConfig[] = [
-  { id: 'prov_1', name: 'Google Gemini', type: ProviderType.LLM, providerId: 'gemini', isEnabled: true, status: 'operational' },
+  { 
+      id: 'prov_1', 
+      name: 'Google Gemini', 
+      type: ProviderType.LLM, 
+      providerId: 'gemini', 
+      isEnabled: true, 
+      status: 'operational',
+      apiKey: process.env.API_KEY, // Inject Key
+      models: ['gemini-3-pro-preview', 'gemini-3-flash-preview', 'gemini-2.5-flash']
+  },
+  { 
+      id: 'prov_openai', 
+      name: 'OpenAI GPT', 
+      type: ProviderType.LLM, 
+      providerId: 'openai', 
+      isEnabled: false, 
+      status: 'untested',
+      models: ['gpt-4o', 'gpt-4-turbo', 'gpt-3.5-turbo']
+  },
   { id: 'prov_2', name: 'Midjourney (Simulated)', type: ProviderType.IMAGE, providerId: 'midjourney', isEnabled: false, status: 'untested' },
   { id: 'prov_3', name: 'ElevenLabs', type: ProviderType.VOICE, providerId: 'elevenlabs', isEnabled: true, status: 'untested' }
 ];
@@ -140,6 +164,24 @@ class StorageService {
     this.save(KEYS.PROVIDERS, list);
   }
 
+  // --- Agent Configurations ---
+  async getAgentConfigs(): Promise<AgentConfiguration[]> {
+      return this.load<AgentConfiguration>(KEYS.AGENT_CONFIGS, []);
+  }
+
+  async getAgentConfig(role: AgentRole): Promise<AgentConfiguration | undefined> {
+      const configs = await this.getAgentConfigs();
+      return configs.find(c => c.agentRole === role);
+  }
+
+  async saveAgentConfig(config: AgentConfiguration): Promise<void> {
+      const list = await this.getAgentConfigs();
+      const index = list.findIndex(c => c.agentRole === config.agentRole);
+      if (index >= 0) list[index] = config;
+      else list.push(config);
+      this.save(KEYS.AGENT_CONFIGS, list);
+  }
+
   // --- Voices ---
   async getVoices(): Promise<VoicePreset[]> {
     await delay(100);
@@ -155,7 +197,7 @@ class StorageService {
     this.save(KEYS.VOICES, list);
   }
 
-  // --- Automations (New) ---
+  // --- Automations ---
   async getAutomations(): Promise<AutomationConfig[]> {
       return this.load<AutomationConfig>(KEYS.AUTOMATIONS, []);
   }
@@ -173,25 +215,24 @@ class StorageService {
       this.save(KEYS.AUTOMATIONS, list.filter(a => a.id !== id));
   }
 
-  // --- Daily Plans (New) ---
+  // --- Daily Plans ---
   async getDailyPlans(): Promise<DailyPlan[]> {
       return this.load<DailyPlan>(KEYS.PLANS, []);
   }
 
   async saveDailyPlan(plan: DailyPlan): Promise<void> {
       const list = await this.getDailyPlans();
-      // Remove existing plan for same automation and date to overwrite
       const filtered = list.filter(p => !(p.automationId === plan.automationId && p.date === plan.date));
       filtered.push(plan);
       this.save(KEYS.PLANS, filtered);
   }
 
-  // --- Runs (Phase 3) ---
+  // --- Runs ---
   async getRuns(): Promise<ProductionRun[]> {
     return this.load<ProductionRun>(KEYS.RUNS, []);
   }
 
-  // --- Jobs (IndexedDB) ---
+  // --- Jobs ---
   async getJobs(): Promise<ProductionJob[]> {
     try {
         const jobs = await idbGetAll<ProductionJob>(STORE_JOBS);
@@ -208,13 +249,10 @@ class StorageService {
                 }
             }
         });
-
-        if (jobs.length === 0) {
-             return [...MOCK_JOBS];
-        }
+        if (jobs.length === 0) return [...MOCK_JOBS];
         return jobs.sort((a, b) => parseInt(b.id.split('_')[1] || '0') - parseInt(a.id.split('_')[1] || '0'));
     } catch (e) {
-        console.error("Failed to load jobs from IDB", e);
+        console.error("Failed to load jobs", e);
         return MOCK_JOBS;
     }
   }
@@ -223,11 +261,55 @@ class StorageService {
     try {
         await idbPut(STORE_JOBS, job);
     } catch (e) {
-        console.error("Failed to save job to IDB", e);
+        console.error("Failed to save job", e);
     }
   }
 
-  // --- Global Usage Tracking ---
+  // --- Admin Jobs ---
+  async getAdminJobs(): Promise<AdminJob[]> {
+      return this.load<AdminJob>(KEYS.ADMIN_JOBS, []);
+  }
+
+  async saveAdminJob(job: AdminJob): Promise<void> {
+      const list = await this.getAdminJobs();
+      const index = list.findIndex(j => j.id === job.id);
+      if (index >= 0) list[index] = job;
+      else list.push(job);
+      this.save(KEYS.ADMIN_JOBS, list);
+  }
+
+  async getAdminJob(id: string): Promise<AdminJob | undefined> {
+      const list = await this.getAdminJobs();
+      return list.find(j => j.id === id);
+  }
+
+  // --- DEV TICKETS ---
+  async getTickets(): Promise<DevelopmentTicket[]> {
+      return this.load<DevelopmentTicket>(KEYS.DEV_TICKETS, []);
+  }
+
+  async saveTicket(ticket: DevelopmentTicket): Promise<void> {
+      const list = await this.getTickets();
+      const index = list.findIndex(t => t.id === ticket.id);
+      if (index >= 0) list[index] = ticket;
+      else list.push(ticket);
+      this.save(KEYS.DEV_TICKETS, list);
+  }
+
+  // --- KPI METRICS (NEW) ---
+  async getAgentMetrics(): Promise<AgentMetrics[]> {
+      return this.load<AgentMetrics>(KEYS.METRICS, []);
+  }
+
+  async saveAgentMetric(metric: AgentMetrics): Promise<void> {
+      const list = await this.getAgentMetrics();
+      const index = list.findIndex(m => m.role === metric.role);
+      if (index >= 0) list[index] = metric;
+      else list.push(metric);
+      this.save(KEYS.METRICS, list);
+  }
+
+  // --- Usage ---
   async getGlobalUsage(): Promise<TokenUsageStats> {
       const data = localStorage.getItem(KEYS.GLOBAL_USAGE);
       return data ? JSON.parse(data) : { promptTokens: 0, responseTokens: 0, totalTokens: 0, estimatedCost: 0 };
@@ -237,21 +319,36 @@ class StorageService {
       const current = await this.getGlobalUsage();
       const newPrompt = current.promptTokens + prompt;
       const newResponse = current.responseTokens + response;
-      
       const costInput = (newPrompt / 1_000_000) * PRICE_INPUT_PER_M;
       const costOutput = (newResponse / 1_000_000) * PRICE_OUTPUT_PER_M;
-
       const updated: TokenUsageStats = {
           promptTokens: newPrompt,
           responseTokens: newResponse,
           totalTokens: newPrompt + newResponse,
           estimatedCost: costInput + costOutput
       };
-
       localStorage.setItem(KEYS.GLOBAL_USAGE, JSON.stringify(updated));
   }
 
-  // --- YouTube Config ---
+  // --- Settings & Auth ---
+  async getAuthSettings(): Promise<AuthSettings> {
+      const data = localStorage.getItem(KEYS.AUTH_SETTINGS);
+      return data ? JSON.parse(data) : { enabled: false, lockAfterMinutes: 30 };
+  }
+
+  async saveAuthSettings(settings: AuthSettings): Promise<void> {
+      localStorage.setItem(KEYS.AUTH_SETTINGS, JSON.stringify(settings));
+  }
+
+  async getAppSettings(): Promise<AppSettings> {
+      const data = localStorage.getItem(KEYS.APP_SETTINGS);
+      return data ? JSON.parse(data) : { serverUrl: 'http://localhost:3000', serverStatus: 'disconnected', theme: 'dark', debugMode: false };
+  }
+
+  async saveAppSettings(settings: AppSettings): Promise<void> {
+      localStorage.setItem(KEYS.APP_SETTINGS, JSON.stringify(settings));
+  }
+
   async getYouTubeConfig(): Promise<YouTubeAuthConfig | null> {
     const data = localStorage.getItem(KEYS.YT_CONFIG);
     return data ? JSON.parse(data) : null;

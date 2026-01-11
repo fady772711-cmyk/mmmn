@@ -1,4 +1,6 @@
 
+// ... (Existing Enums)
+
 // Enums for rigid options
 export enum ChannelType {
   STORY = 'قصصي',
@@ -16,7 +18,8 @@ export enum JobStatus {
 }
 
 export enum AgentRole {
-  ADMIN_PLANNER = 'AdminPlanner', // New for Automations
+  ANALYST_AGENT = 'AnalystAgent',
+  ADMIN_PLANNER = 'AdminPlanner', 
   STRATEGY_DIRECTOR = 'StrategyDirector',
   HOOK_MAKER = 'HookMaker', 
   TITLE_OPTIMIZER = 'TitleGenerator',
@@ -28,12 +31,51 @@ export enum AgentRole {
   SCENE_PLANNER = 'ScenePlanner',
   VISUAL_PRODUCER = 'VisualProducer',
   VOICE_DIRECTOR = 'VoiceDirector',
-  MUSIC_DIRECTOR = 'MusicDirector', // New Agent
+  MUSIC_DIRECTOR = 'MusicDirector', 
   EDITOR_ASSEMBLER = 'EditorAssembler',
   QA_REVIEWER = 'QAReviewer',
+  RISK_AGENT = 'RiskAgent', // New Strict Role
+  SCHEDULER_AGENT = 'SchedulerAgent', // New Strict Role
   PUBLISHER = 'Publisher',
-  THUMBNAIL_MAKER = 'ThumbnailMaker'
+  THUMBNAIL_MAKER = 'ThumbnailMaker',
+  // --- NEW ADMIN EXECUTORS ---
+  BUILDER_EXECUTOR = 'BuilderExecutor',
+  FIXER_EXECUTOR = 'FixerExecutor',
+  PRODUCER_EXECUTOR = 'ProducerExecutor'
 }
+
+// --- KPI & METRICS TYPES (STRICT) ---
+
+export interface AgentMetrics {
+    role: AgentRole;
+    avgExecutionTime: number; // ms
+    maxExecutionTime: number; // ms
+    successCount: number;
+    failureCount: number;
+    failureRate: number; // percentage 0-100
+    qualityScore: number; // 0-100 (Rolling average from QA)
+    humanInterventionCount: number;
+    status: 'ACTIVE' | 'DEGRADED' | 'SUSPENDED';
+    lastUpdated: string;
+}
+
+export interface ProductionLineMetrics {
+    lineType: string; // 'Shorts' | 'Long'
+    videosPerDay: number;
+    avgTimePerVideo: number; // ms
+    failureRate: number;
+    publishSuccessRate: number;
+    idleTimePercentage: number;
+    lastActive: string;
+}
+
+export interface SystemHealthReport {
+    status: 'GREEN' | 'YELLOW' | 'RED';
+    activeAlerts: string[];
+    generatedAt: string;
+}
+
+// ... (Existing ProviderType, ProductionType, AdminScope)
 
 export enum ProviderType {
   LLM = 'LLM',
@@ -47,9 +89,97 @@ export enum ProviderType {
 
 export type ProductionType = 'Long' | 'Shorts';
 export type ProductionLine = 'Long Narrative' | 'Long Explainer' | 'Shorts';
+export type AdminScope = 'Production' | 'Analytics' | 'Automation' | 'UI' | 'DevOps';
 
-// --- Phase 1: Foundation Entities ---
+// --- RUNTIME ABSTRACTION TYPES (NEW) ---
 
+export interface RuntimeSnapshot {
+    id: string;
+    label: string;
+    timestamp: string;
+    filesCount: number;
+}
+
+export interface ExecutionResult {
+    success: boolean;
+    stdout: string;
+    stderr: string;
+    exitCode: number;
+}
+
+export interface FileSystemOp {
+    path: string;
+    content?: string;
+    type: 'write' | 'read' | 'delete';
+}
+
+// --- ARABIC ADMIN TYPES (UPDATED FOR SUPERVISOR) ---
+
+export interface AdminMessage {
+    id: string;
+    role: 'user' | 'admin' | 'system';
+    content: string;
+    timestamp: string;
+    relatedPlanId?: string;
+    relatedTicketId?: string; // New
+}
+
+export interface AdminPlan {
+    id: string;
+    title: string;
+    status: 'PROPOSED' | 'APPROVED' | 'EXECUTING' | 'COMPLETED' | 'FAILED';
+    steps: AdminStep[];
+    executor: AgentRole;
+    snapshotId?: string; // Snapshot taken before execution
+    ticketId?: string; // Linked Ticket
+}
+
+export interface AdminStep {
+    id: string;
+    description: string;
+    command: string; // Internal command string
+    status: 'PENDING' | 'RUNNING' | 'SUCCESS' | 'FAILED';
+    logs: string[];
+}
+
+// --- DEVELOPMENT TICKET TYPES (STRICT PROTOCOL) ---
+
+export enum TicketPriority {
+    A = 'A', // Blocker / Critical
+    B = 'B', // Efficiency
+    C = 'C', // Quality
+    D = 'D'  // Cosmetic
+}
+
+export enum TicketStatus {
+    PROPOSED = 'PROPOSED',
+    APPROVED = 'APPROVED',
+    IN_PROGRESS = 'IN_PROGRESS',
+    TESTED = 'TESTED',
+    RELEASED = 'RELEASED',
+    REJECTED = 'REJECTED'
+}
+
+export interface DevelopmentReport {
+    gap: string;           // Description of the problem
+    impact: string;        // Effect on production/quality
+    proposal: string;      // The exact solution proposed
+    scope: string[];       // List of files allowed to touch
+    risk: string;          // Worst case scenario
+    rollback: string;      // How to undo
+    metric_current: string;// Measurable number before
+    metric_expected: string;// Measurable number after
+    priority: TicketPriority;
+}
+
+export interface DevelopmentTicket extends DevelopmentReport {
+    id: string;
+    status: TicketStatus;
+    createdAt: string;
+    owner: string; // Always ADMIN_SUPERVISOR
+}
+
+// ... (Existing Interfaces: ProviderConfig, AgentConfiguration, VoicePreset, etc.)
 export interface ProviderConfig {
   id: string;
   name: string;
@@ -59,6 +189,15 @@ export interface ProviderConfig {
   isEnabled: boolean;
   status: 'operational' | 'error' | 'untested';
   lastTestedAt?: string;
+  models?: string[]; 
+}
+
+export interface AgentConfiguration {
+  agentRole: AgentRole;
+  providerId: string; 
+  modelId: string; 
+  customSystemInstruction?: string; 
+  temperature?: number;
 }
 
 export interface VoicePreset {
@@ -75,7 +214,7 @@ export interface VoicePreset {
 export interface MusicTrack {
   id: string;
   title: string;
-  url: string; // Mock URL or real file path
+  url: string; 
   tags: string[];
   bpm?: number;
   mood?: string;
@@ -101,18 +240,71 @@ export interface Channel {
   youtubeId?: string; 
   linkedYouTubeChannel?: YouTubeLinkedChannel; 
   status: 'active' | 'paused';
-  
   defaultVoiceId?: string; 
   defaultProviderConfig?: Record<ProviderType, string>; 
   createdAt: string;
-  
   niche?: string;
   audienceDescription?: string;
 }
 
-// --- Phase 3: Pipeline & Automation (Enhanced) ---
+// ... (Existing AgentStandardInput, AgentStandardResponse)
+export interface AgentStandardInput {
+  taskId: string;
+  role: AgentRole;
+  objective: string;
+  inputData: any; 
+  constraints?: string[];
+  context?: any; 
+  meta: {
+    fromAdminDirector: boolean; 
+    timestamp: string;
+    priority: 'Normal' | 'High' | 'Critical';
+  };
+}
 
+export interface AgentStandardResponse {
+  status: 'SUCCESS' | 'FAILURE' | 'RETRY_NEEDED';
+  output: any; 
+  notes: string[]; 
+  warnings: string[]; 
+  usage?: { prompt: number; candidates: number; total: number };
+}
+
+// ... (Existing Admin Director Types)
+export interface DecisionLogEntry {
+  timestamp: string;
+  phase: string;
+  request: string;
+  decision: string;
+  reasoning: string;
+  rejectedAlternatives?: string[];
+}
+
+export interface AdminTask {
+    id: string;
+    title: string;
+    targetSystem: 'Server' | 'DB' | 'Agent';
+    status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+    result?: string;
+    logs: string[];
+}
+
+export interface AdminJob {
+    id: string;
+    brief: string;
+    scopes: AdminScope[];
+    priority: 'Normal' | 'High';
+    status: 'PLANNING' | 'EXECUTING' | 'COMPLETED' | 'FAILED';
+    executionPlan: AdminTask[];
+    decisionsLog: string[]; 
+    structuredDecisions: DecisionLogEntry[]; 
+    finalOutput?: any;
+    createdAt: string;
+}
+
+// ... (Rest of existing types: AutomationConfig, ProductionJob, etc.)
 export interface AutomationAgentConfig {
+  analyst: 'auto' | 'skip';
   strategy: 'auto' | 'manual' | 'skip';
   script: 'auto' | 'manual' | 'skip';
   visuals: 'auto' | 'manual' | 'skip';
@@ -130,79 +322,79 @@ export interface AutomationVisualConfig {
   provider: 'nano_banana' | 'veo_3_1_fast' | 'veo_2' | 'imagen_3';
   mode: 'images' | 'video' | 'mixed';
   fallbackProvider?: string;
-  
-  // New Visual Settings
   imageQuantityMode: 'auto' | 'custom';
-  imageQuantity?: number; // Only if custom
+  imageQuantity?: number; 
   enableTextOverlay: boolean;
   textOverlayStyle?: 'cinematic' | 'subtitles' | 'minimal' | 'bold';
 }
 
 export interface AutomationVoiceSettings {
   mode: 'auto_match_channel' | 'specific_preset';
-  voicePresetId?: string; // If specific
-  speed: number; // 0.8 to 1.2
+  voicePresetId?: string; 
+  speed: number; 
 }
 
 export interface AutomationScheduleConfig {
   timezone: string;
-  times: string[]; // ["09:00", "18:00"]
-  days: string[]; // ["Mon", "Tue", ...]
+  times: string[]; 
+  days: string[]; 
   startDate: string;
   useAdminPlanner: boolean;
 }
 
+export interface AutomationPublishConfig {
+    mode: 'Draft' | 'Private' | 'Scheduled' | 'Public';
+    enableMonetization: boolean;
+    markAsAI: boolean; 
+    autoScheduleOffsetHours?: number; 
+}
+
 export interface AutomationConfig {
   id: string;
-  name: string; // Friendly name
+  name: string; 
   channelId: string;
   pipelineLine: ProductionLine;
   isEnabled: boolean;
-  
-  // Detailed Configurations
   agents: AutomationAgentConfig;
   specs: AutomationVideoSpecs;
   visuals: AutomationVisualConfig;
-  voiceSettings: AutomationVoiceSettings; // New Voice Settings
+  voiceSettings: AutomationVoiceSettings; 
   schedule: AutomationScheduleConfig;
-  
-  publishMode: 'Draft' | 'Private' | 'Scheduled';
+  publishing: AutomationPublishConfig; 
   lastRunAt?: string;
-  
-  // Legacy fields for backward compatibility (optional)
   videosPerDay?: number; 
   scheduleTimes?: string[];
   planningMode?: 'Manual' | 'Agent';
+  publishMode?: string;
 }
 
-// Updated based on new spec
+export interface AutomationRule {
+  id: string;
+  channelId: string;
+  frequency: string;
+  videosPerRun: number;
+  videoType: ChannelType;
+  publishMode: string;
+  createdAt: string;
+}
+
 export interface PlannedItem {
   time: string;
   topic: string;
   title: string;
   angle: string;
-  duration: number; // sec for shorts, min for long
+  duration: number; 
   visual_provider: string;
 }
 
 export interface DailyPlan {
-  id: string; // automationId_YYYY-MM-DD
+  id: string; 
   automationId: string;
   date: string;
   timezone: string;
   target_channel_id: string;
   items: PlannedItem[];
   generatedAt: string;
-}
-
-export interface AutomationRule {
-  id: string;
-  channelId: string;
-  frequency: 'Daily' | 'Weekly';
-  videosPerRun: number;
-  videoType: ChannelType;
-  publishMode: 'Manual' | 'Auto';
-  createdAt: string;
 }
 
 export interface ProductionRun {
@@ -242,7 +434,7 @@ export interface StepControl {
   scenes: 'manual' | 'agent';
   visuals: 'agent'; 
   voice: 'agent';
-  music: 'auto' | 'off' | 'manual'; // New control
+  music: 'auto' | 'off' | 'manual'; 
   publish: 'manual' | 'auto';
 }
 
@@ -250,6 +442,7 @@ export interface ManualInputs {
   title?: string;
   script?: string;
   scenePlanJSON?: string;
+  sourceMaterial?: string; 
 }
 
 export interface ProductionJob {
@@ -262,12 +455,11 @@ export interface ProductionJob {
   steps: ProductionStep[];
   artifacts: Record<string, any>; 
   logs: LogEntry[];
-  
-  // Controls
   durationConfig?: DurationConfig; 
   visualConfig?: VisualConfig;
   stepControl?: StepControl;
   manualInputs?: ManualInputs;
+  publishingConfig?: AutomationPublishConfig;
 }
 
 export interface ProductionStep {
@@ -315,7 +507,16 @@ export interface AgentResult {
   usage?: { prompt: number; candidates: number; total: number };
 }
 
-// --- Specialized Agent Outputs ---
+export interface AnalystResult {
+    analysis_summary: string;
+    identified_trends: string[];
+    performance_verdict: string;
+    suggested_topics: {
+        topic: string;
+        reasoning: string;
+        predicted_performance: string;
+    }[];
+}
 
 export interface AdminPlannerResult {
   date: string;
@@ -377,14 +578,11 @@ export interface SceneDefinition {
   mood: string;
   shot_type: string;
   narration_text?: string; 
-  
   generatedImageUrl?: string; 
   generatedVideoUrl?: string; 
   generatedAudioUrl?: string;
-  
   generatedAudioBlob?: Blob; 
   generatedVideoBlob?: Blob;
-  
   mediaType?: 'image' | 'video';
 }
 
@@ -417,7 +615,6 @@ export interface QAResult {
   checks: string[];
 }
 
-// --- OAuth Types ---
 export interface YouTubeAuthConfig {
   clientId: string;
   clientSecret?: string; 
@@ -429,4 +626,18 @@ export interface YouTubeChannelDetails {
   title: string;
   thumbnail: string;
   customUrl?: string;
+}
+
+export interface AuthSettings {
+    enabled: boolean;
+    username?: string;
+    passwordHash?: string; 
+    lockAfterMinutes: number;
+}
+
+export interface AppSettings {
+    serverUrl: string;
+    serverStatus: 'connected' | 'disconnected';
+    theme: 'dark' | 'light';
+    debugMode: boolean;
 }

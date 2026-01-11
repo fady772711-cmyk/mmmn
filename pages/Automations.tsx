@@ -3,14 +3,16 @@ import React, { useState, useEffect } from 'react';
 import { 
     AutomationConfig, Channel, ProviderConfig, 
     AutomationAgentConfig, AutomationVideoSpecs, AutomationVisualConfig, AutomationScheduleConfig,
-    VoicePreset, AutomationVoiceSettings
+    VoicePreset, AutomationVoiceSettings, AutomationPublishConfig
 } from '../types';
 import { db } from '../services/storageService';
+import { server } from '../services/serverOrchestrator';
 import { 
     Workflow, Play, Pause, Trash2, Plus, ArrowRight, CheckCircle2, 
     AlertTriangle, ShieldAlert, MonitorPlay, Smartphone, Bot, Clock, 
-    Image as ImageIcon, Video, Mic, Calendar, Youtube, Save, X, Activity, Type as TypeIcon, Layers, Settings2
+    Image as ImageIcon, Video, Mic, Calendar, Youtube, Save, X, Activity, Type as TypeIcon, Layers, Settings2, LineChart, DollarSign, CloudLightning
 } from 'lucide-react';
+import InlineCopilot from '../components/InlineCopilot';
 
 const FEATURE_AUTOMATIONS = true;
 
@@ -20,6 +22,7 @@ const Automations: React.FC = () => {
   const [providers, setProviders] = useState<ProviderConfig[]>([]);
   const [voices, setVoices] = useState<VoicePreset[]>([]);
   const [loading, setLoading] = useState(true);
+  const [triggering, setTriggering] = useState(false);
   
   // Builder State
   const [isBuilding, setIsBuilding] = useState(false);
@@ -30,6 +33,7 @@ const Automations: React.FC = () => {
   const [config, setConfig] = useState<Partial<AutomationConfig>>({
       isEnabled: false,
       agents: {
+          analyst: 'auto', // Default Enabled
           strategy: 'auto', script: 'auto', visuals: 'auto', voice: 'auto', music: 'auto'
       },
       specs: {
@@ -50,7 +54,12 @@ const Automations: React.FC = () => {
       schedule: {
           timezone: 'Asia/Riyadh', times: ['12:00'], days: ['Sat','Sun','Mon','Tue','Wed','Thu','Fri'], startDate: new Date().toISOString().split('T')[0], useAdminPlanner: true
       },
-      publishMode: 'Private'
+      publishing: {
+          mode: 'Private',
+          enableMonetization: true,
+          markAsAI: true,
+          autoScheduleOffsetHours: 24
+      }
   });
 
   useEffect(() => {
@@ -70,6 +79,18 @@ const Automations: React.FC = () => {
     setProviders(provs);
     setVoices(voicesData);
     setLoading(false);
+  };
+
+  const handleSimulateDailyTrigger = async () => {
+      setTriggering(true);
+      try {
+          const jobIds = await server.triggerDailySchedule();
+          alert(`تم تشغيل ${jobIds.length} مهمة تلقائية بنجاح!`);
+      } catch(e: any) {
+          alert("خطأ: " + e.message);
+      } finally {
+          setTriggering(false);
+      }
   };
 
   // --- Step Logic ---
@@ -124,7 +145,8 @@ const Automations: React.FC = () => {
           visuals: config.visuals as AutomationVisualConfig,
           voiceSettings: config.voiceSettings as AutomationVoiceSettings,
           schedule: config.schedule as AutomationScheduleConfig,
-          publishMode: config.publishMode!,
+          publishing: config.publishing as AutomationPublishConfig,
+          publishMode: config.publishing?.mode || 'Private', // Mapping legacy
           
           // Legacy Mappings
           videosPerDay: config.specs?.videosPerDay,
@@ -145,6 +167,54 @@ const Automations: React.FC = () => {
           await loadData();
       }
   };
+
+  // --- AI Copilot Handler ---
+  const handleCopilotAction = (actionType: string, data: any) => {
+      if (actionType === 'configure_automation') {
+          // Merge AI suggestions into current config
+          // AI might send channelName instead of ID, need to find ID
+          let channelId = config.channelId;
+          if (data.channelName) {
+              const ch = channels.find(c => c.name.toLowerCase().includes(data.channelName.toLowerCase()));
+              if (ch) channelId = ch.id;
+          }
+
+          setConfig(prev => ({
+              ...prev,
+              ...data.config,
+              channelId: channelId || prev.channelId, // Priority to AI ID if valid, else keep
+              // Ensure deep merge for nested objects if needed, but simplistic spread usually works for top level sections
+              visuals: { ...prev.visuals, ...data.config.visuals },
+              specs: { ...prev.specs, ...data.config.specs },
+              schedule: { ...prev.schedule, ...data.config.schedule }
+          }));
+          
+          // Jump to step 1 to review
+          setActiveStep(1);
+          setValidationError("تم تطبيق إعدادات الوكيل الذكي. يرجى المراجعة.");
+      }
+  };
+
+  const COPILOT_SYSTEM_PROMPT = `You are an Automation Architect Agent.
+Your goal is to help the user configure a video production pipeline.
+Available Channels: ${channels.map(c => c.name).join(', ')}.
+Available Pipelines: Shorts, Long Narrative, Long Explainer.
+
+When the user gives a command (e.g., "Schedule daily horror shorts for my history channel"), output a JSON object with this structure:
+{
+  "action": "configure_automation",
+  "payload": {
+    "channelName": "History Channel",
+    "config": {
+       "pipelineLine": "Shorts",
+       "specs": { "videosPerDay": 1, "targetDuration": 60, "durationUnit": "seconds" },
+       "visuals": { "mode": "video", "provider": "veo_3_1_fast" },
+       "schedule": { "times": ["18:00"] }
+    }
+  },
+  "responseToUser": "I've configured a Shorts pipeline for the History Channel. Review the settings."
+}
+If no action is needed, just reply with text.`;
 
   // --- Render Steps ---
 
@@ -206,12 +276,42 @@ const Automations: React.FC = () => {
                       </div>
                   </div>
               );
-          case 3: // Agents
+          case 3: // Agents (Including Analyst)
               return (
                   <div className="space-y-6">
                       <h3 className="text-lg font-bold text-white flex items-center gap-2"><Bot /> تكوين الوكلاء (Agents Configuration)</h3>
+                      
+                      {/* Analyst Agent Config */}
+                      <div className="bg-blue-900/10 border border-blue-900/50 p-6 rounded-xl mb-4">
+                          <div className="flex items-center justify-between mb-2">
+                              <div className="flex items-center gap-3">
+                                  <div className="bg-blue-500 text-white p-2 rounded-lg">
+                                      <LineChart size={20} />
+                                  </div>
+                                  <div>
+                                      <h4 className="font-bold text-blue-400">Analyst Agent (محلل القناة)</h4>
+                                      <p className="text-xs text-slate-400">يحلل أداء القناة، الجمهور، والترندات لاقتراح مواضيع (Feedback Loop).</p>
+                                  </div>
+                              </div>
+                              <label className="relative inline-flex items-center cursor-pointer">
+                                <input 
+                                    type="checkbox" 
+                                    className="sr-only peer" 
+                                    checked={config.agents?.analyst === 'auto'}
+                                    onChange={(e) => setConfig({...config, agents: { ...config.agents!, analyst: e.target.checked ? 'auto' : 'skip' }})}
+                                />
+                                <div className="w-11 h-6 bg-slate-700 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-blue-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+                              </label>
+                          </div>
+                          {config.agents?.analyst === 'auto' && (
+                              <div className="mt-2 text-xs text-slate-500 border-t border-blue-900/30 pt-2">
+                                  سيقوم المحلل بالاتصال ببيانات القناة قبل كل عملية إنتاج لتوجيه الـ Strategy Director نحو المواضيع الأكثر جاذبية.
+                              </div>
+                          )}
+                      </div>
+
                       <div className="bg-slate-900 border border-slate-800 rounded-xl divide-y divide-slate-800">
-                          {Object.keys(config.agents!).map((key) => (
+                          {Object.keys(config.agents!).filter(k => k !== 'analyst').map((key) => (
                               <div key={key} className="p-4 flex items-center justify-between">
                                   <span className="capitalize text-slate-300 font-medium">{key} Agent</span>
                                   <div className="flex bg-slate-950 rounded p-1 border border-slate-700">
@@ -531,11 +631,11 @@ const Automations: React.FC = () => {
                       </div>
                   </div>
               );
-          case 8: // Publishing
+          case 8: // Publishing (Enhanced)
               const ch = channels.find(c => c.id === config.channelId);
               return (
                   <div className="space-y-6">
-                      <h3 className="text-lg font-bold text-white flex items-center gap-2"><Youtube /> النشر النهائي</h3>
+                      <h3 className="text-lg font-bold text-white flex items-center gap-2"><Youtube /> إعدادات النشر المتقدمة</h3>
                       
                       <div className={`p-6 rounded-xl border flex items-start gap-4 ${ch?.linkedYouTubeChannel ? 'bg-green-900/10 border-green-900/30' : 'bg-red-900/10 border-red-900/30'}`}>
                           {ch?.linkedYouTubeChannel ? <CheckCircle2 className="text-green-500" /> : <AlertTriangle className="text-red-500" />}
@@ -547,17 +647,49 @@ const Automations: React.FC = () => {
                           </div>
                       </div>
 
-                      <div>
-                          <label className="text-slate-400 text-sm block mb-2">Privacy Status</label>
-                          <select 
-                            value={config.publishMode}
-                            onChange={e => setConfig({...config, publishMode: e.target.value as any})}
-                            className="w-full bg-slate-900 border border-slate-700 rounded p-3 text-white"
-                          >
-                              <option value="Draft">Draft (Upload but don't publish)</option>
-                              <option value="Private">Private</option>
-                              <option value="Scheduled">Scheduled (Using YouTube Scheduler)</option>
-                          </select>
+                      <div className="space-y-4">
+                          <div>
+                              <label className="text-slate-400 text-sm block mb-2 font-bold">Privacy & Schedule</label>
+                              <select 
+                                value={config.publishing?.mode}
+                                onChange={e => setConfig({...config, publishing: { ...config.publishing!, mode: e.target.value as any }})}
+                                className="w-full bg-slate-900 border border-slate-700 rounded p-3 text-white mb-2"
+                              >
+                                  <option value="Draft">Draft (Upload only)</option>
+                                  <option value="Private">Private</option>
+                                  <option value="Scheduled">Scheduled (Recommended)</option>
+                                  <option value="Public">Public (Immediate)</option>
+                              </select>
+                              {config.publishing?.mode === 'Scheduled' && (
+                                  <p className="text-xs text-slate-500 flex items-center gap-2">
+                                      <Clock size={12} /> سيتم الجدولة بعد 24 ساعة من وقت الإنتاج تلقائياً.
+                                  </p>
+                              )}
+                          </div>
+
+                          <div className="grid grid-cols-2 gap-4 pt-4 border-t border-slate-800">
+                              <div className={`p-4 rounded-xl border cursor-pointer transition ${config.publishing?.enableMonetization ? 'bg-green-900/10 border-green-500/50' : 'bg-slate-900 border-slate-800'}`}
+                                   onClick={() => setConfig({...config, publishing: { ...config.publishing!, enableMonetization: !config.publishing?.enableMonetization }})}>
+                                  <div className="flex items-center gap-2 mb-2">
+                                      <div className={`p-1.5 rounded-full ${config.publishing?.enableMonetization ? 'bg-green-500 text-white' : 'bg-slate-800 text-slate-500'}`}>
+                                          <DollarSign size={16} />
+                                      </div>
+                                      <span className="font-bold text-slate-200">Monetization</span>
+                                  </div>
+                                  <p className="text-xs text-slate-500">Enable ads & revenue (Requires Partner Program)</p>
+                              </div>
+
+                              <div className={`p-4 rounded-xl border cursor-pointer transition ${config.publishing?.markAsAI ? 'bg-blue-900/10 border-blue-500/50' : 'bg-slate-900 border-slate-800'}`}
+                                   onClick={() => setConfig({...config, publishing: { ...config.publishing!, markAsAI: !config.publishing?.markAsAI }})}>
+                                  <div className="flex items-center gap-2 mb-2">
+                                      <div className={`p-1.5 rounded-full ${config.publishing?.markAsAI ? 'bg-blue-500 text-white' : 'bg-slate-800 text-slate-500'}`}>
+                                          <Bot size={16} />
+                                      </div>
+                                      <span className="font-bold text-slate-200">AI Content Label</span>
+                                  </div>
+                                  <p className="text-xs text-slate-500">Mark as "Altered content" per YouTube Policy.</p>
+                              </div>
+                          </div>
                       </div>
                   </div>
               );
@@ -595,10 +727,20 @@ const Automations: React.FC = () => {
           <p className="text-slate-400">بناء خطوط إنتاج مؤتمتة بالكامل</p>
         </div>
         {!isBuilding && (
-            <button onClick={() => setIsBuilding(true)} className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg font-medium flex items-center gap-2">
-                <Plus size={18} />
-                <span>قاعدة جديدة</span>
-            </button>
+            <div className="flex gap-2">
+                <button 
+                    onClick={handleSimulateDailyTrigger}
+                    disabled={triggering}
+                    className="bg-slate-800 border border-slate-700 hover:bg-slate-700 text-slate-300 px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition"
+                >
+                    {triggering ? <Activity className="animate-spin" size={18} /> : <CloudLightning size={18} />}
+                    <span>تشغيل الجدولة اليومية (Simulation)</span>
+                </button>
+                <button onClick={() => setIsBuilding(true)} className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg font-medium flex items-center gap-2">
+                    <Plus size={18} />
+                    <span>قاعدة جديدة</span>
+                </button>
+            </div>
         )}
       </div>
 
@@ -610,9 +752,9 @@ const Automations: React.FC = () => {
               </div>
 
               {/* Body */}
-              <div className="flex-1 p-8 grid grid-cols-3 gap-8">
-                  {/* Form Area */}
-                  <div className="col-span-2">
+              <div className="flex-1 p-8 grid grid-cols-1 lg:grid-cols-3 gap-8">
+                  {/* Left Column: Form Area */}
+                  <div className="lg:col-span-2 order-2 lg:order-1">
                       {renderStepContent()}
                       {validationError && (
                           <div className="mt-4 p-3 bg-red-900/20 border border-red-900/50 text-red-400 rounded flex items-center gap-2">
@@ -621,36 +763,36 @@ const Automations: React.FC = () => {
                       )}
                   </div>
 
-                  {/* Sidebar Summary */}
-                  <div className="bg-slate-900/50 border-r border-slate-800 -my-8 -mr-8 p-6 space-y-4">
-                      <h4 className="font-bold text-slate-400 uppercase text-xs tracking-wider border-b border-slate-800 pb-2">Configuration Summary</h4>
-                      <div className="space-y-3 text-sm">
-                          <div>
-                              <span className="block text-slate-500 text-xs">Channel</span>
-                              <span className="text-slate-200">{channels.find(c => c.id === config.channelId)?.name || '-'}</span>
-                          </div>
-                          <div>
-                              <span className="block text-slate-500 text-xs">Pipeline</span>
-                              <span className="text-slate-200">{config.pipelineLine || '-'}</span>
-                          </div>
-                          <div>
-                              <span className="block text-slate-500 text-xs">Visuals</span>
-                              <span className="text-slate-200">{config.visuals?.provider} / {config.visuals?.mode}</span>
-                              <span className="block text-xs text-blue-400 mt-1">
-                                  {config.visuals?.enableTextOverlay ? `Text: ${config.visuals.textOverlayStyle}` : 'No Text'}
-                              </span>
-                          </div>
-                          <div>
-                              <span className="block text-slate-500 text-xs">Voice</span>
-                              <span className="text-slate-200">
-                                  {config.voiceSettings?.mode === 'auto_match_channel' ? 'Auto Match' : 'Specific Preset'}
-                              </span>
-                          </div>
-                          <div>
-                              <span className="block text-slate-500 text-xs">Schedule</span>
-                              <span className="text-slate-200">{config.schedule?.times.length} videos @ {config.schedule?.days.length} days/week</span>
-                          </div>
-                      </div>
+                  {/* Right Column: AI Assistant & Summary */}
+                  <div className="order-1 lg:order-2 space-y-6">
+                       {/* AI Copilot */}
+                       <InlineCopilot 
+                           title="Automation Architect"
+                           subtitle="صف ما تريده وسأقوم بضبط الإعدادات لك."
+                           placeholder="مثال: جهز خطة شورتات رعب لقناة التاريخ..."
+                           systemPrompt={COPILOT_SYSTEM_PROMPT}
+                           onAction={handleCopilotAction}
+                           compact
+                       />
+
+                       {/* Summary */}
+                       <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-6 space-y-4">
+                           <h4 className="font-bold text-slate-400 uppercase text-xs tracking-wider border-b border-slate-800 pb-2">Configuration Summary</h4>
+                           <div className="space-y-3 text-sm">
+                               <div>
+                                   <span className="block text-slate-500 text-xs">Channel</span>
+                                   <span className="text-slate-200">{channels.find(c => c.id === config.channelId)?.name || '-'}</span>
+                               </div>
+                               <div>
+                                   <span className="block text-slate-500 text-xs">Pipeline</span>
+                                   <span className="text-slate-200">{config.pipelineLine || '-'}</span>
+                               </div>
+                               <div>
+                                   <span className="block text-slate-500 text-xs">Visuals</span>
+                                   <span className="text-slate-200">{config.visuals?.provider} / {config.visuals?.mode}</span>
+                               </div>
+                           </div>
+                       </div>
                   </div>
               </div>
 
@@ -686,7 +828,8 @@ const Automations: React.FC = () => {
                                   <div className="flex items-center gap-3 text-xs text-slate-400 mt-1">
                                       <span className="bg-slate-800 px-2 py-0.5 rounded">{auto.pipelineLine}</span>
                                       <span>• {auto.specs.videosPerDay} videos/day</span>
-                                      <span>• {auto.schedule.useAdminPlanner ? 'Auto-Planned' : 'Manual'}</span>
+                                      <span>• {auto.publishing.mode}</span>
+                                      {auto.agents.analyst === 'auto' && <span className="text-blue-400">• Analyst Active</span>}
                                   </div>
                               </div>
                           </div>
