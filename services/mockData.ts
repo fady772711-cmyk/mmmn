@@ -1,4 +1,5 @@
 
+
 import { Channel, ProductionRun, ProductionJob, JobStatus, AgentRole, ChannelType, AutomationRule, MusicTrack, AutomationConfig } from '../types';
 
 export const MOCK_CHANNELS: Channel[] = [
@@ -91,6 +92,8 @@ export const MOCK_JOBS: ProductionJob[] = [
     logs: [
       { timestamp: new Date().toISOString(), level: 'INFO', agent: AgentRole.STRATEGY_DIRECTOR, message: 'Start processing topic: Fall of Rome' },
       { timestamp: new Date().toISOString(), level: 'INFO', agent: AgentRole.STRATEGY_DIRECTOR, message: 'Strategy defined successfully' },
-    ]
+    ],
+    createdAt: new Date().toISOString(),
+    progress: 25
   }
 ];

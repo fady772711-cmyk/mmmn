@@ -1,53 +1,70 @@
 
 import { ProductionJob, AutomationConfig, AdminScope } from '../types';
-import { db } from './storageService';
-import { adminDirector } from './adminDirector';
+
+const API_BASE = '/api'; // Relative path, handled by Nginx or Vite Proxy
 
 /**
- * ServerOrchestrator
- * NOW JUST A FACADE.
- * It passes requests to the AdminDirector.
+ * ServerOrchestrator (Client Side Adapter)
+ * Delegates ALL logic to the backend API.
+ * Throws error if any attempt to execute locally is made.
  */
 class ServerOrchestrator {
     
-    // Legacy support: Start Job -> Wraps it for Admin
     async startJob(jobConfig: Partial<ProductionJob>): Promise<string> {
-        // We create a "Shadow Admin Job" to handle this production request
-        const brief = `Production Request: ${jobConfig.title}. Type: ${jobConfig.type}`;
-        return this.runAdminAgent(brief, ['Production'], 'Normal');
+        console.log("[Orchestrator] Enqueuing job to Server:", jobConfig.title);
+        
+        const response = await fetch(`${API_BASE}/jobs/enqueue`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                type: jobConfig.type || 'Long',
+                payload: jobConfig
+            })
+        });
+
+        if (!response.ok) {
+            throw new Error(`Server Refused Job: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        return data.jobId;
     }
 
     async triggerDailySchedule(): Promise<string[]> {
-        // This would call AdminDirector's "SchedulerAgent" capability in the future
-        console.log("Triggering via AdminDirector...");
-        return [];
+        // In this strict mode, client cannot trigger schedule logic directly, 
+        // it must ask server endpoint to do it.
+        const response = await fetch(`${API_BASE}/smoke/run`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode: 'full_schedule_trigger' })
+        });
+        const data = await response.json();
+        return [data.jobId];
     }
 
     // --- ADMIN AGENT ENTRY POINT ---
 
     async runAdminAgent(brief: string, scopes: AdminScope[], priority: 'Normal' | 'High'): Promise<string> {
-        // 1. Create the Record
-        const jobId = `admin_${Date.now()}`;
-        await db.saveAdminJob({
-            id: jobId,
-            brief,
-            scopes: scopes as any, // Fix type mismatch if enum differs
-            priority,
-            status: 'PLANNING',
-            executionPlan: [],
-            decisionsLog: [],
-            structuredDecisions: [],
-            createdAt: new Date().toISOString()
+        // Enqueue an Admin type job
+        const response = await fetch(`${API_BASE}/jobs/enqueue`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                type: 'AdminTask',
+                payload: { brief, scopes, priority }
+            })
         });
-
-        // 2. Delegate execution to the Director (Fire & Forget)
-        adminDirector.executeMission(jobId);
-
-        return jobId;
+        const data = await response.json();
+        return data.jobId;
     }
 
     async getAdminJobStatus(jobId: string) {
-        return await db.getAdminJob(jobId);
+        // Poll API
+        const response = await fetch(`${API_BASE}/jobs/${jobId}`);
+        if (response.ok) {
+            return await response.json();
+        }
+        return null;
     }
 }
 

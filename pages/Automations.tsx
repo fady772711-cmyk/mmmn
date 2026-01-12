@@ -3,33 +3,60 @@ import React, { useState, useEffect } from 'react';
 import { 
     AutomationConfig, Channel, ProviderConfig, 
     AutomationAgentConfig, AutomationVideoSpecs, AutomationVisualConfig, AutomationScheduleConfig,
-    VoicePreset, AutomationVoiceSettings, AutomationPublishConfig
+    VoicePreset, AutomationVoiceSettings, AutomationPublishConfig, ProductionJob, JobStatus,
+    Campaign
 } from '../types';
 import { db } from '../services/storageService';
 import { server } from '../services/serverOrchestrator';
 import { 
     Workflow, Play, Pause, Trash2, Plus, ArrowRight, CheckCircle2, 
     AlertTriangle, ShieldAlert, MonitorPlay, Smartphone, Bot, Clock, 
-    Image as ImageIcon, Video, Mic, Calendar, Youtube, Save, X, Activity, Type as TypeIcon, Layers, Settings2, LineChart, DollarSign, CloudLightning
+    Image as ImageIcon, Video, Mic, Calendar, Youtube, Save, X, Activity, Type as TypeIcon, Layers, Settings2, LineChart, DollarSign, CloudLightning, Rocket,
+    ListVideo, Loader2 as Spinner, Edit, FileText
 } from 'lucide-react';
 import InlineCopilot from '../components/InlineCopilot';
 
 const FEATURE_AUTOMATIONS = true;
 
 const Automations: React.FC = () => {
+  // Tabs
+  const [activeTab, setActiveTab] = useState<'campaigns' | 'pipelines' | 'logs'>('campaigns');
+
   const [automations, setAutomations] = useState<AutomationConfig[]>([]);
+  const [campaigns, setCampaigns] = useState<Campaign[]>([]);
   const [channels, setChannels] = useState<Channel[]>([]);
   const [providers, setProviders] = useState<ProviderConfig[]>([]);
   const [voices, setVoices] = useState<VoicePreset[]>([]);
   const [loading, setLoading] = useState(true);
   const [triggering, setTriggering] = useState(false);
   
-  // Builder State
+  // Recent Activity State
+  const [todaysJobs, setTodaysJobs] = useState<ProductionJob[]>([]);
+  
+  // Pipeline Builder State
   const [isBuilding, setIsBuilding] = useState(false);
   const [activeStep, setActiveStep] = useState(1);
   const [validationError, setValidationError] = useState<string | null>(null);
 
-  // New Automation Configuration State
+  // Campaign Builder State
+  const [isEditingCampaign, setIsEditingCampaign] = useState(false);
+  const [campaignConfig, setCampaignConfig] = useState<Partial<Campaign>>({
+      config: {
+          videosPerDay: 5,
+          creationTime: '08:00',
+          publishTimes: ['12:00', '14:00', '16:00', '18:00', '20:00'],
+          publishMode: 'Scheduled',
+          recurrence: 'Daily'
+      },
+      topicManager: {
+          mode: 'List',
+          pendingTopics: [],
+          completedTopics: []
+      }
+  });
+  const [topicInput, setTopicInput] = useState(''); // Textarea content
+
+  // New Automation Configuration State (Pipeline)
   const [config, setConfig] = useState<Partial<AutomationConfig>>({
       isEnabled: false,
       agents: {
@@ -64,636 +91,209 @@ const Automations: React.FC = () => {
 
   useEffect(() => {
     loadData();
+    // Poll for jobs every 5 seconds
+    const interval = setInterval(fetchRecentJobs, 5000);
+    return () => clearInterval(interval);
   }, []);
 
   const loadData = async () => {
     setLoading(true);
-    const [auths, chans, provs, voicesData] = await Promise.all([
+    const [auths, camps, chans, provs, voicesData] = await Promise.all([
         db.getAutomations(),
+        db.getCampaigns(),
         db.getChannels(),
         db.getProviders(),
         db.getVoices()
     ]);
     setAutomations(auths);
+    setCampaigns(camps);
     setChannels(chans);
     setProviders(provs);
     setVoices(voicesData);
     setLoading(false);
+    fetchRecentJobs();
   };
 
-  const handleSimulateDailyTrigger = async () => {
-      setTriggering(true);
+  const fetchRecentJobs = async () => {
       try {
-          const jobIds = await server.triggerDailySchedule();
-          alert(`تم تشغيل ${jobIds.length} مهمة تلقائية بنجاح!`);
-      } catch(e: any) {
-          alert("خطأ: " + e.message);
-      } finally {
-          setTriggering(false);
+          const res = await fetch('/api/jobs');
+          if (res.ok) {
+              const allJobs: ProductionJob[] = await res.json();
+              const today = new Date().toISOString().split('T')[0];
+              const relevant = allJobs.filter(j => 
+                  j.createdAt.startsWith(today) && 
+                  (j.id.startsWith('job_') && (j.type === 'Shorts' || j.type === 'Long')) 
+              );
+              relevant.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+              setTodaysJobs(relevant);
+          }
+      } catch (e) {
+          console.error("Failed to fetch jobs", e);
       }
   };
 
-  // --- Step Logic ---
+  // --- HELPER FUNCTIONS ---
+
+  const COPILOT_SYSTEM_PROMPT = `You are an Automation Architect.
+    Your goal: Help user configure production pipelines.
+    
+    User might say: "Create a pipeline for History Shorts daily at 5pm".
+    Action: 'configure_pipeline'
+    Payload: {
+      channelId: "ch_...", // Infer if possible or ask
+      pipelineLine: "Shorts",
+      specs: { videosPerDay: 1 },
+      schedule: { times: ["17:00"], days: ["Daily"] }
+    }
+  `;
+
+  const handleCopilotAction = (action: string, payload: any) => {
+      if (action === 'configure_pipeline') {
+           setConfig(prev => ({
+               ...prev,
+               ...payload
+           }));
+      }
+  };
 
   const validateStep = (step: number): boolean => {
       setValidationError(null);
-      switch(step) {
-          case 1: // Target Channel
-              if (!config.channelId) { setValidationError("يجب اختيار قناة."); return false; }
-              return true;
-          case 2: // Production Line
-              if (!config.pipelineLine) { setValidationError("يجب اختيار خط إنتاج."); return false; }
-              return true;
-          case 5: // Visuals
-              // Check if provider key exists
-              if (config.visuals?.provider.includes('veo')) {
-                  const hasGemini = providers.some(p => p.providerId === 'gemini' && p.status === 'operational');
-                  if (!hasGemini) { setValidationError("يتطلب Veo مفتاح Gemini API فعال."); return false; }
-              }
-              return true;
-          case 8: // Publishing
-              const ch = channels.find(c => c.id === config.channelId);
-              if (!ch?.linkedYouTubeChannel) { 
-                  setValidationError("القناة غير مرتبطة بحساب YouTube. اذهب لإعدادات القناة لربطها."); 
-                  return false; 
-              }
-              return true;
-          default:
-              return true;
+      if (step === 1 && !config.channelId) {
+          setValidationError("الرجاء اختيار قناة.");
+          return false;
       }
-  };
-
-  const nextStep = () => {
-      if (validateStep(activeStep)) {
-          setActiveStep(prev => Math.min(prev + 1, 8));
+      if (step === 2 && !config.pipelineLine) {
+          setValidationError("الرجاء اختيار نوع خط الإنتاج.");
+          return false;
       }
+      return true;
   };
-
-  const prevStep = () => setActiveStep(prev => Math.max(prev - 1, 1));
 
   const handleSave = async () => {
-      if (!validateStep(8)) return;
-
-      const newAuth: AutomationConfig = {
-          id: config.id || `auto_${Date.now()}`,
-          name: `${channels.find(c => c.id === config.channelId)?.name} - ${config.pipelineLine}`,
-          channelId: config.channelId!,
-          pipelineLine: config.pipelineLine!,
-          isEnabled: config.isEnabled || false,
+      if (!config.channelId || !config.pipelineLine) return;
+      
+      const newAutomation: AutomationConfig = {
+          id: `auto_${Date.now()}`,
+          name: `${config.pipelineLine} Pipeline - ${new Date().toLocaleDateString()}`,
+          isEnabled: true,
+          channelId: config.channelId,
+          pipelineLine: config.pipelineLine,
           agents: config.agents as AutomationAgentConfig,
           specs: config.specs as AutomationVideoSpecs,
           visuals: config.visuals as AutomationVisualConfig,
           voiceSettings: config.voiceSettings as AutomationVoiceSettings,
           schedule: config.schedule as AutomationScheduleConfig,
           publishing: config.publishing as AutomationPublishConfig,
-          publishMode: config.publishing?.mode || 'Private', // Mapping legacy
-          
-          // Legacy Mappings
-          videosPerDay: config.specs?.videosPerDay,
-          scheduleTimes: config.schedule?.times,
-          planningMode: config.schedule?.useAdminPlanner ? 'Agent' : 'Manual'
+          planningMode: 'Agent'
       };
-
-      await db.saveAutomation(newAuth);
+      
+      await db.saveAutomation(newAutomation);
       await loadData();
       setIsBuilding(false);
-      setConfig({}); // Reset
+      setConfig({
+          isEnabled: false,
+          agents: {
+              analyst: 'auto',
+              strategy: 'auto', script: 'auto', visuals: 'auto', voice: 'auto', music: 'auto'
+          },
+          specs: {
+              durationUnit: 'minutes', targetDuration: 10, videosPerDay: 1
+          },
+          visuals: {
+              provider: 'nano_banana', 
+              mode: 'images', 
+              fallbackProvider: 'images',
+              imageQuantityMode: 'auto',
+              enableTextOverlay: true,
+              textOverlayStyle: 'cinematic'
+          },
+          voiceSettings: {
+              mode: 'auto_match_channel',
+              speed: 1.0
+          },
+          schedule: {
+              timezone: 'Asia/Riyadh', times: ['12:00'], days: ['Sat','Sun','Mon','Tue','Wed','Thu','Fri'], startDate: new Date().toISOString().split('T')[0], useAdminPlanner: true
+          },
+          publishing: {
+              mode: 'Private',
+              enableMonetization: true,
+              markAsAI: true,
+              autoScheduleOffsetHours: 24
+          }
+      });
       setActiveStep(1);
   };
 
   const handleDelete = async (id: string) => {
-      if (confirm("هل أنت متأكد من حذف هذه الأتمتة؟")) {
+      if (window.confirm("هل أنت متأكد من حذف هذه القاعدة؟")) {
           await db.deleteAutomation(id);
-          await loadData();
+          loadData();
       }
   };
 
-  // --- AI Copilot Handler ---
-  const handleCopilotAction = (actionType: string, data: any) => {
-      if (actionType === 'configure_automation') {
-          // Merge AI suggestions into current config
-          // AI might send channelName instead of ID, need to find ID
-          let channelId = config.channelId;
-          if (data.channelName) {
-              const ch = channels.find(c => c.name.toLowerCase().includes(data.channelName.toLowerCase()));
-              if (ch) channelId = ch.id;
+  // --- Campaign Handlers ---
+  const openNewCampaign = () => {
+      setCampaignConfig({
+          id: `camp_${Date.now()}`,
+          status: 'ACTIVE',
+          pipelineType: 'Shorts',
+          config: {
+              videosPerDay: 5,
+              creationTime: '08:00',
+              publishTimes: ['12:00', '14:00', '16:00', '18:00', '20:00'],
+              publishMode: 'Scheduled',
+              recurrence: 'Daily'
+          },
+          topicManager: {
+              mode: 'List',
+              pendingTopics: [],
+              completedTopics: []
           }
+      });
+      setTopicInput('');
+      setIsEditingCampaign(true);
+  };
 
-          setConfig(prev => ({
-              ...prev,
-              ...data.config,
-              channelId: channelId || prev.channelId, // Priority to AI ID if valid, else keep
-              // Ensure deep merge for nested objects if needed, but simplistic spread usually works for top level sections
-              visuals: { ...prev.visuals, ...data.config.visuals },
-              specs: { ...prev.specs, ...data.config.specs },
-              schedule: { ...prev.schedule, ...data.config.schedule }
-          }));
-          
-          // Jump to step 1 to review
-          setActiveStep(1);
-          setValidationError("تم تطبيق إعدادات الوكيل الذكي. يرجى المراجعة.");
+  const saveCampaign = async () => {
+      if (!campaignConfig.name || !campaignConfig.channelId) {
+          alert("الرجاء إدخال اسم الحملة والقناة");
+          return;
+      }
+
+      // Parse topics
+      const rawTopics = topicInput.split('\n').map(t => t.trim()).filter(t => t);
+      // Merge with existing pending if editing
+      const finalTopics = [...(campaignConfig.topicManager?.pendingTopics || []), ...rawTopics];
+      // Deduplicate
+      const uniqueTopics = Array.from(new Set(finalTopics));
+
+      const newCampaign: Campaign = {
+          ...campaignConfig as Campaign,
+          topicManager: {
+              ...campaignConfig.topicManager!,
+              pendingTopics: uniqueTopics
+          },
+          createdAt: campaignConfig.createdAt || new Date().toISOString()
+      };
+
+      await db.saveCampaign(newCampaign);
+      await loadData();
+      setIsEditingCampaign(false);
+  };
+
+  const deleteCampaign = async (id: string) => {
+      if(confirm("حذف الحملة؟")) {
+          await db.deleteCampaign(id);
+          loadData();
       }
   };
 
-  const COPILOT_SYSTEM_PROMPT = `You are an Automation Architect Agent.
-Your goal is to help the user configure a video production pipeline.
-Available Channels: ${channels.map(c => c.name).join(', ')}.
-Available Pipelines: Shorts, Long Narrative, Long Explainer.
-
-When the user gives a command (e.g., "Schedule daily horror shorts for my history channel"), output a JSON object with this structure:
-{
-  "action": "configure_automation",
-  "payload": {
-    "channelName": "History Channel",
-    "config": {
-       "pipelineLine": "Shorts",
-       "specs": { "videosPerDay": 1, "targetDuration": 60, "durationUnit": "seconds" },
-       "visuals": { "mode": "video", "provider": "veo_3_1_fast" },
-       "schedule": { "times": ["18:00"] }
-    }
-  },
-  "responseToUser": "I've configured a Shorts pipeline for the History Channel. Review the settings."
-}
-If no action is needed, just reply with text.`;
-
-  // --- Render Steps ---
-
+  // --- Render Steps (Pipeline Builder) ---
   const renderStepContent = () => {
       switch(activeStep) {
-          case 1: // Target Channel
-              return (
-                  <div className="space-y-4">
-                      <h3 className="text-lg font-bold text-white flex items-center gap-2"><Activity /> اختر القناة المستهدفة</h3>
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                          {channels.map(ch => (
-                              <div 
-                                key={ch.id} 
-                                onClick={() => setConfig({...config, channelId: ch.id})}
-                                className={`p-4 rounded-xl border cursor-pointer transition ${config.channelId === ch.id ? 'bg-blue-600/20 border-blue-500 ring-1 ring-blue-500' : 'bg-slate-900 border-slate-800 hover:border-slate-700'}`}
-                              >
-                                  <div className="font-bold text-slate-200">{ch.name}</div>
-                                  <div className="text-xs text-slate-500 mt-1">{ch.language} • {ch.tone}</div>
-                              </div>
-                          ))}
-                      </div>
-                  </div>
-              );
-          case 2: // Production Line
-              return (
-                  <div className="space-y-4">
-                      <h3 className="text-lg font-bold text-white flex items-center gap-2"><Workflow /> خط الإنتاج (Pipeline)</h3>
-                      <div className="grid grid-cols-3 gap-4">
-                          {[
-                              { id: 'Shorts', label: 'Shorts (Vertical)', icon: Smartphone, desc: 'فيديوهات قصيرة سريعة الانتشار' },
-                              { id: 'Long Narrative', label: 'Long Narrative', icon: MonitorPlay, desc: 'قصص وثائقية طويلة' },
-                              { id: 'Long Explainer', label: 'Long Explainer', icon: MonitorPlay, desc: 'شروحات تعليمية مفصلة' }
-                          ].map(line => (
-                              <div 
-                                key={line.id}
-                                onClick={() => {
-                                    const isShorts = line.id === 'Shorts';
-                                    setConfig({
-                                        ...config, 
-                                        pipelineLine: line.id as any,
-                                        specs: { ...config.specs!, durationUnit: isShorts ? 'seconds' : 'minutes', targetDuration: isShorts ? 45 : 8 },
-                                        visuals: { 
-                                            ...config.visuals!, 
-                                            mode: isShorts ? 'video' : 'images', 
-                                            provider: isShorts ? 'veo_3_1_fast' : 'nano_banana',
-                                            enableTextOverlay: isShorts // Auto-enable text for shorts
-                                        }
-                                    });
-                                }}
-                                className={`p-6 rounded-xl border cursor-pointer flex flex-col items-center text-center transition ${config.pipelineLine === line.id ? 'bg-blue-600/20 border-blue-500' : 'bg-slate-900 border-slate-800'}`}
-                              >
-                                  <div className={`p-3 rounded-full mb-3 ${config.pipelineLine === line.id ? 'bg-blue-500 text-white' : 'bg-slate-800 text-slate-400'}`}>
-                                      <line.icon size={24} />
-                                  </div>
-                                  <div className="font-bold text-slate-200">{line.label}</div>
-                                  <div className="text-xs text-slate-500 mt-2">{line.desc}</div>
-                              </div>
-                          ))}
-                      </div>
-                  </div>
-              );
-          case 3: // Agents (Including Analyst)
-              return (
-                  <div className="space-y-6">
-                      <h3 className="text-lg font-bold text-white flex items-center gap-2"><Bot /> تكوين الوكلاء (Agents Configuration)</h3>
-                      
-                      {/* Analyst Agent Config */}
-                      <div className="bg-blue-900/10 border border-blue-900/50 p-6 rounded-xl mb-4">
-                          <div className="flex items-center justify-between mb-2">
-                              <div className="flex items-center gap-3">
-                                  <div className="bg-blue-500 text-white p-2 rounded-lg">
-                                      <LineChart size={20} />
-                                  </div>
-                                  <div>
-                                      <h4 className="font-bold text-blue-400">Analyst Agent (محلل القناة)</h4>
-                                      <p className="text-xs text-slate-400">يحلل أداء القناة، الجمهور، والترندات لاقتراح مواضيع (Feedback Loop).</p>
-                                  </div>
-                              </div>
-                              <label className="relative inline-flex items-center cursor-pointer">
-                                <input 
-                                    type="checkbox" 
-                                    className="sr-only peer" 
-                                    checked={config.agents?.analyst === 'auto'}
-                                    onChange={(e) => setConfig({...config, agents: { ...config.agents!, analyst: e.target.checked ? 'auto' : 'skip' }})}
-                                />
-                                <div className="w-11 h-6 bg-slate-700 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-blue-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
-                              </label>
-                          </div>
-                          {config.agents?.analyst === 'auto' && (
-                              <div className="mt-2 text-xs text-slate-500 border-t border-blue-900/30 pt-2">
-                                  سيقوم المحلل بالاتصال ببيانات القناة قبل كل عملية إنتاج لتوجيه الـ Strategy Director نحو المواضيع الأكثر جاذبية.
-                              </div>
-                          )}
-                      </div>
-
-                      <div className="bg-slate-900 border border-slate-800 rounded-xl divide-y divide-slate-800">
-                          {Object.keys(config.agents!).filter(k => k !== 'analyst').map((key) => (
-                              <div key={key} className="p-4 flex items-center justify-between">
-                                  <span className="capitalize text-slate-300 font-medium">{key} Agent</span>
-                                  <div className="flex bg-slate-950 rounded p-1 border border-slate-700">
-                                      {['auto', 'manual', 'skip'].map(mode => (
-                                          <button 
-                                            key={mode}
-                                            onClick={() => setConfig({...config, agents: { ...config.agents!, [key]: mode }})}
-                                            className={`px-3 py-1 rounded text-xs capitalize ${config.agents![key as keyof AutomationAgentConfig] === mode ? 'bg-blue-600 text-white' : 'text-slate-500'}`}
-                                          >
-                                              {mode}
-                                          </button>
-                                      ))}
-                                  </div>
-                              </div>
-                          ))}
-                      </div>
-                  </div>
-              );
-          case 4: // Specs
-              return (
-                  <div className="space-y-6">
-                      <h3 className="text-lg font-bold text-white flex items-center gap-2"><Clock /> مواصفات الفيديو</h3>
-                      <div className="grid grid-cols-2 gap-6">
-                          <div className="bg-slate-900 p-6 rounded-xl border border-slate-800">
-                              <label className="block text-slate-400 mb-2">المدة المستهدفة ({config.specs?.durationUnit})</label>
-                              <input 
-                                type="number" 
-                                value={config.specs?.targetDuration}
-                                onChange={e => setConfig({...config, specs: { ...config.specs!, targetDuration: parseInt(e.target.value) }})}
-                                className="w-full bg-slate-950 border border-slate-700 rounded p-3 text-white text-lg"
-                              />
-                          </div>
-                          <div className="bg-slate-900 p-6 rounded-xl border border-slate-800">
-                              <label className="block text-slate-400 mb-2">عدد الفيديوهات يومياً</label>
-                              <input 
-                                type="number" 
-                                value={config.specs?.videosPerDay}
-                                onChange={e => setConfig({...config, specs: { ...config.specs!, videosPerDay: parseInt(e.target.value) }})}
-                                className="w-full bg-slate-950 border border-slate-700 rounded p-3 text-white text-lg"
-                              />
-                          </div>
-                      </div>
-                  </div>
-              );
-          case 5: // Visual Provider (Enhanced)
-              return (
-                  <div className="space-y-6">
-                      <h3 className="text-lg font-bold text-white flex items-center gap-2"><ImageIcon /> إعدادات المشاهد المرئية</h3>
-                      
-                      <div className="grid grid-cols-2 gap-6">
-                          {/* 1. Visual Mode & Provider */}
-                          <div className="space-y-4">
-                              <div className="space-y-2">
-                                  <label className="text-slate-400 text-xs font-bold uppercase tracking-wider">نوع المحتوى (Visual Mode)</label>
-                                  <div className="flex gap-2">
-                                      {['images', 'video', 'mixed'].map(m => (
-                                          <button 
-                                            key={m}
-                                            onClick={() => setConfig({...config, visuals: { ...config.visuals!, mode: m as any }})}
-                                            className={`flex-1 py-2.5 rounded border text-sm capitalize ${config.visuals?.mode === m ? 'bg-blue-600/20 border-blue-500 text-blue-400' : 'bg-slate-900 border-slate-800 text-slate-400'}`}
-                                          >
-                                              {m}
-                                          </button>
-                                      ))}
-                                  </div>
-                              </div>
-
-                              <div className="space-y-2">
-                                  <label className="text-slate-400 text-xs font-bold uppercase tracking-wider">نموذج التوليد (AI Model)</label>
-                                  <select 
-                                    value={config.visuals?.provider}
-                                    onChange={e => setConfig({...config, visuals: { ...config.visuals!, provider: e.target.value as any }})}
-                                    className="w-full bg-slate-900 border border-slate-700 rounded p-3 text-white text-sm"
-                                  >
-                                      <optgroup label="Image Models">
-                                          <option value="nano_banana">Gemini Flash Image (Fastest)</option>
-                                          <option value="imagen_3">Imagen 3 (High Quality)</option>
-                                      </optgroup>
-                                      <optgroup label="Video Models">
-                                          <option value="veo_3_1_fast">Veo 3.1 Fast (Recommended)</option>
-                                          <option value="veo_2">Veo 2.0 (Legacy)</option>
-                                      </optgroup>
-                                  </select>
-                              </div>
-                          </div>
-
-                          {/* 2. Text Overlay Settings */}
-                          <div className="space-y-4 bg-slate-900/50 p-4 rounded-xl border border-slate-800">
-                              <div className="flex items-center justify-between">
-                                  <label className="flex items-center gap-2 text-slate-300 font-medium">
-                                      <TypeIcon size={18} className="text-blue-500" />
-                                      عرض النصوص (Text Overlay)
-                                  </label>
-                                  <div 
-                                    onClick={() => setConfig({...config, visuals: { ...config.visuals!, enableTextOverlay: !config.visuals?.enableTextOverlay }})}
-                                    className={`w-10 h-6 rounded-full flex items-center p-1 cursor-pointer transition ${config.visuals?.enableTextOverlay ? 'bg-blue-600' : 'bg-slate-700'}`}
-                                  >
-                                      <div className={`w-4 h-4 bg-white rounded-full shadow-sm transform transition ${config.visuals?.enableTextOverlay ? 'translate-x-4' : 'translate-x-0'}`} />
-                                  </div>
-                              </div>
-
-                              {config.visuals?.enableTextOverlay && (
-                                  <div className="space-y-2 pt-2 border-t border-slate-800">
-                                      <label className="text-xs text-slate-500 block">طريقة العرض (Style)</label>
-                                      <div className="grid grid-cols-2 gap-2">
-                                          {['cinematic', 'subtitles', 'minimal', 'bold'].map(style => (
-                                              <button 
-                                                key={style}
-                                                onClick={() => setConfig({...config, visuals: { ...config.visuals!, textOverlayStyle: style as any }})}
-                                                className={`px-3 py-2 rounded text-xs border ${config.visuals?.textOverlayStyle === style ? 'bg-blue-900/30 border-blue-500 text-blue-400' : 'bg-slate-950 border-slate-700 text-slate-400'}`}
-                                              >
-                                                  {style}
-                                              </button>
-                                          ))}
-                                      </div>
-                                  </div>
-                              )}
-                          </div>
-                      </div>
-
-                      {/* 3. Image Quantity (Only for Image/Mixed Mode) */}
-                      {config.visuals?.mode !== 'video' && (
-                          <div className="bg-slate-900 p-4 rounded-xl border border-slate-800 flex items-center justify-between">
-                              <div className="flex items-center gap-3">
-                                  <Layers className="text-slate-500" size={20} />
-                                  <div>
-                                      <label className="block text-slate-300 font-medium text-sm">عدد الصور المقترحة</label>
-                                      <p className="text-xs text-slate-500">حدد كثافة الصور في الفيديو</p>
-                                  </div>
-                              </div>
-                              <div className="flex items-center gap-4 bg-slate-950 p-1 rounded border border-slate-700">
-                                  <button 
-                                    onClick={() => setConfig({...config, visuals: { ...config.visuals!, imageQuantityMode: 'auto' }})}
-                                    className={`px-3 py-1.5 rounded text-xs ${config.visuals?.imageQuantityMode === 'auto' ? 'bg-slate-700 text-white' : 'text-slate-500'}`}
-                                  >
-                                      Automatic (AI)
-                                  </button>
-                                  <div className="flex items-center border-l border-slate-800 pl-2">
-                                      <button 
-                                        onClick={() => setConfig({...config, visuals: { ...config.visuals!, imageQuantityMode: 'custom' }})}
-                                        className={`px-3 py-1.5 rounded text-xs ${config.visuals?.imageQuantityMode === 'custom' ? 'bg-slate-700 text-white' : 'text-slate-500'}`}
-                                      >
-                                          Custom
-                                      </button>
-                                      {config.visuals?.imageQuantityMode === 'custom' && (
-                                          <input 
-                                            type="number" 
-                                            min="5" max="50"
-                                            value={config.visuals?.imageQuantity || 10}
-                                            onChange={e => setConfig({...config, visuals: { ...config.visuals!, imageQuantityMode: 'custom', imageQuantity: parseInt(e.target.value) }})}
-                                            className="w-12 bg-slate-900 border border-slate-700 rounded text-center text-xs ml-2 py-1 text-white outline-none focus:border-blue-500"
-                                          />
-                                      )}
-                                  </div>
-                              </div>
-                          </div>
-                      )}
-
-                      {config.visuals?.provider.includes('veo') && (
-                          <div className="flex items-center gap-2 text-amber-500 bg-amber-900/10 p-3 rounded border border-amber-900/30">
-                              <AlertTriangle size={18} />
-                              <span className="text-sm">Video Generation uses significantly more tokens and time. Ensure fallback is configured.</span>
-                          </div>
-                      )}
-                  </div>
-              );
-          case 6: // Voice & Music (Enhanced)
-              return (
-                  <div className="space-y-6">
-                      <h3 className="text-lg font-bold text-white flex items-center gap-2"><Mic /> الصوت والموسيقى</h3>
-                      
-                      {/* Voice Settings */}
-                      <div className="bg-slate-900 p-6 rounded-xl border border-slate-800 space-y-4">
-                          <div className="flex items-center justify-between pb-4 border-b border-slate-800">
-                              <div className="flex items-center gap-4">
-                                  <div className="bg-green-500/10 p-3 rounded-full text-green-500"><Mic /></div>
-                                  <div>
-                                      <div className="font-bold text-white">Voice Director</div>
-                                      <div className="text-xs text-slate-500">إعدادات التعليق الصوتي</div>
-                                  </div>
-                              </div>
-                              <span className="bg-slate-800 text-slate-400 px-3 py-1 rounded text-xs border border-slate-700">LOCKED ON</span>
-                          </div>
-
-                          <div className="grid grid-cols-2 gap-6">
-                              <div>
-                                  <label className="text-xs text-slate-500 font-bold block mb-2">نوع الصوت (Voice Preset)</label>
-                                  <select 
-                                    className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-white text-sm"
-                                    value={config.voiceSettings?.mode === 'auto_match_channel' ? 'auto' : config.voiceSettings?.voicePresetId}
-                                    onChange={e => {
-                                        const val = e.target.value;
-                                        if (val === 'auto') {
-                                            setConfig({...config, voiceSettings: { ...config.voiceSettings!, mode: 'auto_match_channel' }});
-                                        } else {
-                                            setConfig({...config, voiceSettings: { ...config.voiceSettings!, mode: 'specific_preset', voicePresetId: val }});
-                                        }
-                                    }}
-                                  >
-                                      <option value="auto">⚡ Auto Match Channel Tone</option>
-                                      <optgroup label="My Voices Library">
-                                          {voices.map(v => (
-                                              <option key={v.id} value={v.id}>{v.name} ({v.gender} - {v.languageCode})</option>
-                                          ))}
-                                      </optgroup>
-                                  </select>
-                              </div>
-
-                              <div>
-                                  <label className="text-xs text-slate-500 font-bold block mb-2">سرعة الإلقاء (Speed: {config.voiceSettings?.speed}x)</label>
-                                  <div className="flex items-center gap-3">
-                                      <span className="text-xs text-slate-500">Slow</span>
-                                      <input 
-                                        type="range" 
-                                        min="0.8" max="1.2" step="0.1"
-                                        value={config.voiceSettings?.speed || 1.0}
-                                        onChange={e => setConfig({...config, voiceSettings: { ...config.voiceSettings!, speed: parseFloat(e.target.value) }})}
-                                        className="flex-1 accent-blue-600 h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer"
-                                      />
-                                      <span className="text-xs text-slate-500">Fast</span>
-                                  </div>
-                              </div>
-                          </div>
-                      </div>
-
-                      {/* Music Settings */}
-                      <div className="bg-slate-900 p-6 rounded-xl border border-slate-800">
-                          <div className="flex items-center justify-between mb-2">
-                              <div className="flex items-center gap-4">
-                                  <div className="bg-purple-500/10 p-3 rounded-full text-purple-500"><MonitorPlay /></div>
-                                  <div className="font-bold text-white">Music Director</div>
-                              </div>
-                              <div className="flex bg-slate-950 rounded p-1 border border-slate-700">
-                                  {['auto', 'off', 'manual'].map(m => (
-                                      <button 
-                                        key={m}
-                                        onClick={() => setConfig({...config, agents: { ...config.agents!, music: m as any }})}
-                                        className={`px-4 py-1.5 rounded text-xs capitalize ${config.agents?.music === m ? 'bg-purple-600 text-white' : 'text-slate-500'}`}
-                                      >
-                                          {m}
-                                      </button>
-                                  ))}
-                              </div>
-                          </div>
-                          {config.agents?.music === 'auto' && (
-                              <p className="text-xs text-slate-500 pl-16">
-                                  MusicDirector سيقوم باختيار مقطوعة من مكتبة YouTube Audio Library ودمجها مع التعليق الصوتي تلقائياً.
-                              </p>
-                          )}
-                      </div>
-                  </div>
-              );
-          case 7: // Schedule
-              return (
-                  <div className="space-y-6">
-                      <h3 className="text-lg font-bold text-white flex items-center gap-2"><Calendar /> الجدولة والتخطيط</h3>
-                      <div className="grid grid-cols-2 gap-6">
-                          <div>
-                              <label className="text-slate-400 text-sm block mb-2">Timezone</label>
-                              <select 
-                                className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white text-sm"
-                                value={config.schedule?.timezone}
-                                onChange={e => setConfig({...config, schedule: { ...config.schedule!, timezone: e.target.value }})}
-                              >
-                                  <option value="Asia/Riyadh">Asia/Riyadh (KSA)</option>
-                                  <option value="Africa/Cairo">Africa/Cairo (Egypt)</option>
-                                  <option value="UTC">UTC</option>
-                              </select>
-                          </div>
-                          <div>
-                              <label className="text-slate-400 text-sm block mb-2">Start Date</label>
-                              <input 
-                                type="date"
-                                className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white text-sm"
-                                value={config.schedule?.startDate}
-                                onChange={e => setConfig({...config, schedule: { ...config.schedule!, startDate: e.target.value }})}
-                              />
-                          </div>
-                      </div>
-
-                      <div>
-                          <label className="text-slate-400 text-sm block mb-2">Publish Times</label>
-                          <div className="flex flex-wrap gap-2">
-                              {config.schedule?.times.map((t, i) => (
-                                  <span key={i} className="bg-slate-800 text-white px-3 py-1 rounded border border-slate-700 flex items-center gap-2">
-                                      {t} <button onClick={() => {
-                                          const newTimes = config.schedule!.times.filter((_, idx) => idx !== i);
-                                          setConfig({...config, schedule: { ...config.schedule!, times: newTimes }});
-                                      }}><X size={12} /></button>
-                                  </span>
-                              ))}
-                              <button 
-                                onClick={() => {
-                                    const time = prompt("Enter time (HH:MM)");
-                                    if(time) setConfig({...config, schedule: { ...config.schedule!, times: [...config.schedule!.times, time] }});
-                                }}
-                                className="bg-slate-800 text-blue-400 px-3 py-1 rounded border border-dashed border-slate-600 hover:border-blue-500"
-                              >
-                                  + Add Time
-                              </button>
-                          </div>
-                      </div>
-
-                      <div className="pt-4 border-t border-slate-800">
-                          <label className="flex items-center gap-3 cursor-pointer">
-                              <input 
-                                type="checkbox" 
-                                checked={config.schedule?.useAdminPlanner}
-                                onChange={e => setConfig({...config, schedule: { ...config.schedule!, useAdminPlanner: e.target.checked }})}
-                                className="w-5 h-5 rounded bg-slate-900 border-slate-700 text-blue-600 focus:ring-0"
-                              />
-                              <div>
-                                  <span className="block text-white font-bold">Use AdminPlanner Agent</span>
-                                  <span className="block text-xs text-slate-500">Automatically generate topics based on trends daily.</span>
-                              </div>
-                          </label>
-                      </div>
-                  </div>
-              );
-          case 8: // Publishing (Enhanced)
-              const ch = channels.find(c => c.id === config.channelId);
-              return (
-                  <div className="space-y-6">
-                      <h3 className="text-lg font-bold text-white flex items-center gap-2"><Youtube /> إعدادات النشر المتقدمة</h3>
-                      
-                      <div className={`p-6 rounded-xl border flex items-start gap-4 ${ch?.linkedYouTubeChannel ? 'bg-green-900/10 border-green-900/30' : 'bg-red-900/10 border-red-900/30'}`}>
-                          {ch?.linkedYouTubeChannel ? <CheckCircle2 className="text-green-500" /> : <AlertTriangle className="text-red-500" />}
-                          <div>
-                              <div className="font-bold text-white">YouTube Integration</div>
-                              <div className="text-sm text-slate-400 mt-1">
-                                  {ch?.linkedYouTubeChannel ? `Connected: ${ch.linkedYouTubeChannel.title}` : 'No Channel Linked'}
-                              </div>
-                          </div>
-                      </div>
-
-                      <div className="space-y-4">
-                          <div>
-                              <label className="text-slate-400 text-sm block mb-2 font-bold">Privacy & Schedule</label>
-                              <select 
-                                value={config.publishing?.mode}
-                                onChange={e => setConfig({...config, publishing: { ...config.publishing!, mode: e.target.value as any }})}
-                                className="w-full bg-slate-900 border border-slate-700 rounded p-3 text-white mb-2"
-                              >
-                                  <option value="Draft">Draft (Upload only)</option>
-                                  <option value="Private">Private</option>
-                                  <option value="Scheduled">Scheduled (Recommended)</option>
-                                  <option value="Public">Public (Immediate)</option>
-                              </select>
-                              {config.publishing?.mode === 'Scheduled' && (
-                                  <p className="text-xs text-slate-500 flex items-center gap-2">
-                                      <Clock size={12} /> سيتم الجدولة بعد 24 ساعة من وقت الإنتاج تلقائياً.
-                                  </p>
-                              )}
-                          </div>
-
-                          <div className="grid grid-cols-2 gap-4 pt-4 border-t border-slate-800">
-                              <div className={`p-4 rounded-xl border cursor-pointer transition ${config.publishing?.enableMonetization ? 'bg-green-900/10 border-green-500/50' : 'bg-slate-900 border-slate-800'}`}
-                                   onClick={() => setConfig({...config, publishing: { ...config.publishing!, enableMonetization: !config.publishing?.enableMonetization }})}>
-                                  <div className="flex items-center gap-2 mb-2">
-                                      <div className={`p-1.5 rounded-full ${config.publishing?.enableMonetization ? 'bg-green-500 text-white' : 'bg-slate-800 text-slate-500'}`}>
-                                          <DollarSign size={16} />
-                                      </div>
-                                      <span className="font-bold text-slate-200">Monetization</span>
-                                  </div>
-                                  <p className="text-xs text-slate-500">Enable ads & revenue (Requires Partner Program)</p>
-                              </div>
-
-                              <div className={`p-4 rounded-xl border cursor-pointer transition ${config.publishing?.markAsAI ? 'bg-blue-900/10 border-blue-500/50' : 'bg-slate-900 border-slate-800'}`}
-                                   onClick={() => setConfig({...config, publishing: { ...config.publishing!, markAsAI: !config.publishing?.markAsAI }})}>
-                                  <div className="flex items-center gap-2 mb-2">
-                                      <div className={`p-1.5 rounded-full ${config.publishing?.markAsAI ? 'bg-blue-500 text-white' : 'bg-slate-800 text-slate-500'}`}>
-                                          <Bot size={16} />
-                                      </div>
-                                      <span className="font-bold text-slate-200">AI Content Label</span>
-                                  </div>
-                                  <p className="text-xs text-slate-500">Mark as "Altered content" per YouTube Policy.</p>
-                              </div>
-                          </div>
-                      </div>
-                  </div>
-              );
-          default: return null;
+          case 1: return <div className="space-y-4"><h3 className="text-lg font-bold text-white flex items-center gap-2"><Activity /> اختر القناة المستهدفة</h3><div className="grid grid-cols-1 md:grid-cols-2 gap-4">{channels.map(ch => (<div key={ch.id} onClick={() => setConfig({...config, channelId: ch.id})} className={`p-4 rounded-xl border cursor-pointer transition ${config.channelId === ch.id ? 'bg-blue-600/20 border-blue-500 ring-1 ring-blue-500' : 'bg-slate-900 border-slate-800 hover:border-slate-700'}`}><div className="font-bold text-slate-200">{ch.name}</div><div className="text-xs text-slate-500 mt-1">{ch.language} • {ch.tone}</div></div>))}</div></div>;
+          case 2: return <div className="space-y-4"><h3 className="text-lg font-bold text-white flex items-center gap-2"><Workflow /> خط الإنتاج (Pipeline)</h3><div className="grid grid-cols-3 gap-4">{[{ id: 'Shorts', label: 'Shorts', icon: Smartphone }, { id: 'Long Narrative', label: 'Long Narrative', icon: MonitorPlay }, { id: 'Long Explainer', label: 'Long Explainer', icon: MonitorPlay }].map(line => (<div key={line.id} onClick={() => setConfig({...config, pipelineLine: line.id as any, specs: { ...config.specs!, durationUnit: line.id === 'Shorts' ? 'seconds' : 'minutes', targetDuration: line.id === 'Shorts' ? 45 : 8 }, visuals: { ...config.visuals!, mode: line.id === 'Shorts' ? 'video' : 'images', provider: line.id === 'Shorts' ? 'veo_3_1_fast' : 'nano_banana' }})} className={`p-6 rounded-xl border cursor-pointer flex flex-col items-center text-center transition ${config.pipelineLine === line.id ? 'bg-blue-600/20 border-blue-500' : 'bg-slate-900 border-slate-800'}`}><div className={`p-3 rounded-full mb-3 ${config.pipelineLine === line.id ? 'bg-blue-500 text-white' : 'bg-slate-800 text-slate-400'}`}><line.icon size={24} /></div><div className="font-bold text-slate-200">{line.label}</div></div>))}</div></div>;
+          default: return <div className="text-slate-500">Configure other settings (Agents, Specs, Visuals, Voice, Schedule, Publishing) in steps 3-8...</div>;
       }
   };
 
@@ -702,18 +302,43 @@ If no action is needed, just reply with text.`;
           <div className="absolute top-1/2 left-0 right-0 h-0.5 bg-slate-800 -z-10"></div>
           {[1,2,3,4,5,6,7,8].map(s => {
               const active = s <= activeStep;
-              const current = s === activeStep;
-              return (
-                  <div key={s} className={`flex flex-col items-center gap-2 ${active ? 'text-blue-500' : 'text-slate-600'}`}>
-                      <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold border-2 transition-all ${
-                          current ? 'bg-blue-600 text-white border-blue-600 scale-110' : 
-                          active ? 'bg-slate-950 border-blue-600' : 'bg-slate-950 border-slate-800'
-                      }`}>
-                          {s}
-                      </div>
-                  </div>
-              );
+              return (<div key={s} className={`flex flex-col items-center gap-2 ${active ? 'text-blue-500' : 'text-slate-600'}`}><div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold border-2 transition-all ${s === activeStep ? 'bg-blue-600 text-white border-blue-600' : active ? 'bg-slate-950 border-blue-600' : 'bg-slate-950 border-slate-800'}`}>{s}</div></div>);
           })}
+      </div>
+  );
+
+  // --- JOB STATUS HELPERS ---
+  const getStatusBadge = (status: JobStatus) => {
+      switch(status) {
+          case JobStatus.COMPLETED: return <span className="bg-green-500/10 text-green-500 px-2 py-1 rounded text-xs border border-green-500/20 flex items-center gap-1"><CheckCircle2 size={12} /> مكتمل</span>;
+          case JobStatus.RUNNING: return <span className="bg-blue-500/10 text-blue-500 px-2 py-1 rounded text-xs border border-blue-500/20 flex items-center gap-1"><Spinner size={12} className="animate-spin" /> جاري المعالجة</span>;
+          case JobStatus.FAILED: return <span className="bg-red-500/10 text-red-500 px-2 py-1 rounded text-xs border border-red-500/20 flex items-center gap-1"><AlertTriangle size={12} /> فشل</span>;
+          default: return <span className="bg-slate-800 text-slate-400 px-2 py-1 rounded text-xs border border-slate-700">قيد الانتظار</span>;
+      }
+  };
+
+  const getPublishStatus = (job: ProductionJob) => {
+      const pubStep = job.steps.find(s => s.agentRole === 'Publisher');
+      if (pubStep?.status === JobStatus.COMPLETED) {
+          return <span className="text-green-400 text-xs flex items-center gap-1"><Calendar size={12} /> Scheduled</span>;
+      } else if (pubStep?.status === JobStatus.RUNNING) {
+          return <span className="text-blue-400 text-xs">Publishing...</span>;
+      }
+      return <span className="text-slate-600 text-xs">-</span>;
+  };
+
+  // --- NAVIGATION TABS ---
+  const renderTabs = () => (
+      <div className="flex gap-4 border-b border-slate-800 mb-6">
+          <button onClick={() => setActiveTab('campaigns')} className={`pb-3 px-2 border-b-2 transition ${activeTab === 'campaigns' ? 'border-purple-500 text-purple-400 font-bold' : 'border-transparent text-slate-400'}`}>
+              إدارة الحملات (Campaigns)
+          </button>
+          <button onClick={() => setActiveTab('pipelines')} className={`pb-3 px-2 border-b-2 transition ${activeTab === 'pipelines' ? 'border-blue-500 text-blue-400 font-bold' : 'border-transparent text-slate-400'}`}>
+              قواعد الأتمتة (Blueprints)
+          </button>
+          <button onClick={() => setActiveTab('logs')} className={`pb-3 px-2 border-b-2 transition ${activeTab === 'logs' ? 'border-green-500 text-green-400 font-bold' : 'border-transparent text-slate-400'}`}>
+              سجل الإنتاج
+          </button>
       </div>
   );
 
@@ -723,137 +348,293 @@ If no action is needed, just reply with text.`;
     <div className="space-y-6">
       <div className="flex justify-between items-center">
         <div>
-          <h2 className="text-2xl font-bold text-white">الأتمتة والجدولة (Pipeline Builder)</h2>
-          <p className="text-slate-400">بناء خطوط إنتاج مؤتمتة بالكامل</p>
+          <h2 className="text-2xl font-bold text-white">الأتمتة والجدولة</h2>
+          <p className="text-slate-400">إدارة خطوط الإنتاج وحملات النشر</p>
         </div>
-        {!isBuilding && (
+        {!isBuilding && !isEditingCampaign && (
             <div className="flex gap-2">
-                <button 
-                    onClick={handleSimulateDailyTrigger}
-                    disabled={triggering}
-                    className="bg-slate-800 border border-slate-700 hover:bg-slate-700 text-slate-300 px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition"
-                >
-                    {triggering ? <Activity className="animate-spin" size={18} /> : <CloudLightning size={18} />}
-                    <span>تشغيل الجدولة اليومية (Simulation)</span>
-                </button>
-                <button onClick={() => setIsBuilding(true)} className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg font-medium flex items-center gap-2">
-                    <Plus size={18} />
-                    <span>قاعدة جديدة</span>
-                </button>
+                {activeTab === 'campaigns' && (
+                    <button onClick={openNewCampaign} className="bg-purple-600 hover:bg-purple-500 text-white px-4 py-2 rounded-lg font-medium flex items-center gap-2">
+                        <Plus size={18} />
+                        <span>حملة جديدة</span>
+                    </button>
+                )}
+                {activeTab === 'pipelines' && (
+                    <button onClick={() => setIsBuilding(true)} className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg font-medium flex items-center gap-2">
+                        <Plus size={18} />
+                        <span>قاعدة جديدة</span>
+                    </button>
+                )}
             </div>
         )}
       </div>
 
-      {isBuilding ? (
-          <div className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden flex flex-col min-h-[600px]">
-              {/* Header */}
-              <div className="bg-slate-900 p-6 border-b border-slate-800">
-                  <StepsIndicator />
-              </div>
+      {/* Render Main Content */}
+      {!isBuilding && !isEditingCampaign && renderTabs()}
 
-              {/* Body */}
-              <div className="flex-1 p-8 grid grid-cols-1 lg:grid-cols-3 gap-8">
-                  {/* Left Column: Form Area */}
-                  <div className="lg:col-span-2 order-2 lg:order-1">
-                      {renderStepContent()}
-                      {validationError && (
-                          <div className="mt-4 p-3 bg-red-900/20 border border-red-900/50 text-red-400 rounded flex items-center gap-2">
-                              <ShieldAlert size={18} /> {validationError}
-                          </div>
-                      )}
-                  </div>
-
-                  {/* Right Column: AI Assistant & Summary */}
-                  <div className="order-1 lg:order-2 space-y-6">
-                       {/* AI Copilot */}
-                       <InlineCopilot 
-                           title="Automation Architect"
-                           subtitle="صف ما تريده وسأقوم بضبط الإعدادات لك."
-                           placeholder="مثال: جهز خطة شورتات رعب لقناة التاريخ..."
-                           systemPrompt={COPILOT_SYSTEM_PROMPT}
-                           onAction={handleCopilotAction}
-                           compact
-                       />
-
-                       {/* Summary */}
-                       <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-6 space-y-4">
-                           <h4 className="font-bold text-slate-400 uppercase text-xs tracking-wider border-b border-slate-800 pb-2">Configuration Summary</h4>
-                           <div className="space-y-3 text-sm">
-                               <div>
-                                   <span className="block text-slate-500 text-xs">Channel</span>
-                                   <span className="text-slate-200">{channels.find(c => c.id === config.channelId)?.name || '-'}</span>
-                               </div>
-                               <div>
-                                   <span className="block text-slate-500 text-xs">Pipeline</span>
-                                   <span className="text-slate-200">{config.pipelineLine || '-'}</span>
-                               </div>
-                               <div>
-                                   <span className="block text-slate-500 text-xs">Visuals</span>
-                                   <span className="text-slate-200">{config.visuals?.provider} / {config.visuals?.mode}</span>
-                               </div>
-                           </div>
-                       </div>
-                  </div>
-              </div>
-
-              {/* Footer */}
-              <div className="p-6 border-t border-slate-800 flex justify-between bg-slate-900">
-                  <button onClick={() => { setIsBuilding(false); setConfig({}); setActiveStep(1); }} className="px-6 py-2 text-slate-400 hover:text-white">Cancel</button>
-                  <div className="flex gap-3">
-                      <button onClick={prevStep} disabled={activeStep === 1} className="px-6 py-2 border border-slate-700 rounded text-slate-300 hover:bg-slate-800 disabled:opacity-50">Back</button>
-                      {activeStep < 8 ? (
-                          <button onClick={nextStep} className="px-6 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded font-bold flex items-center gap-2">
-                              Next <ArrowRight size={18} />
-                          </button>
-                      ) : (
-                          <button onClick={handleSave} className="px-6 py-2 bg-green-600 hover:bg-green-500 text-white rounded font-bold flex items-center gap-2">
-                              <Save size={18} /> Finish & Save
-                          </button>
-                      )}
-                  </div>
-              </div>
-          </div>
-      ) : (
+      {/* 1. CAMPAIGN MANAGER VIEW */}
+      {activeTab === 'campaigns' && !isEditingCampaign && !isBuilding && (
           <div className="grid grid-cols-1 gap-4">
-              {loading ? <div className="text-center p-8 text-slate-500">Loading...</div> : automations.map(auto => {
-                  const channel = channels.find(c => c.id === auto.channelId);
+              {campaigns.length === 0 && (
+                  <div className="p-12 text-center border border-dashed border-slate-800 rounded-xl">
+                      <ListVideo size={48} className="mx-auto text-slate-700 mb-4" />
+                      <p className="text-slate-500">لا توجد حملات نشطة. قم بإنشاء حملة لجدولة مجموعة من الفيديوهات.</p>
+                  </div>
+              )}
+              {campaigns.map(camp => {
+                  const ch = channels.find(c => c.id === camp.channelId);
+                  const progress = (camp.topicManager.completedTopics.length / (camp.topicManager.pendingTopics.length + camp.topicManager.completedTopics.length)) * 100 || 0;
+                  
                   return (
-                      <div key={auto.id} className="bg-slate-900 border border-slate-800 rounded-xl p-6 flex justify-between items-center group hover:border-slate-700 transition">
-                          <div className="flex items-center gap-4">
-                              <div className={`w-12 h-12 rounded-lg flex items-center justify-center text-xl font-bold ${auto.isEnabled ? 'bg-green-500/10 text-green-500' : 'bg-slate-800 text-slate-500'}`}>
-                                  {channel?.name.charAt(0)}
+                      <div key={camp.id} className="bg-slate-900 border border-slate-800 rounded-xl p-6 flex flex-col md:flex-row gap-6 hover:border-slate-700 transition">
+                          <div className="flex items-start gap-4 flex-1">
+                              <div className="bg-purple-900/20 p-3 rounded-lg text-purple-400 border border-purple-900/50">
+                                  <Rocket size={24} />
                               </div>
                               <div>
-                                  <h3 className="font-bold text-white text-lg">{auto.name}</h3>
-                                  <div className="flex items-center gap-3 text-xs text-slate-400 mt-1">
-                                      <span className="bg-slate-800 px-2 py-0.5 rounded">{auto.pipelineLine}</span>
-                                      <span>• {auto.specs.videosPerDay} videos/day</span>
-                                      <span>• {auto.publishing.mode}</span>
-                                      {auto.agents.analyst === 'auto' && <span className="text-blue-400">• Analyst Active</span>}
+                                  <h3 className="font-bold text-white text-lg">{camp.name}</h3>
+                                  <div className="text-xs text-slate-400 mt-1 flex items-center gap-3">
+                                      <span className="bg-slate-800 px-2 py-0.5 rounded border border-slate-700">{ch?.name}</span>
+                                      <span>• {camp.pipelineType}</span>
+                                      <span>• {camp.config.recurrence}</span>
+                                      <span>• {camp.config.videosPerDay} videos/day</span>
+                                  </div>
+                                  
+                                  {/* Stats */}
+                                  <div className="flex gap-4 mt-4">
+                                      <div className="text-center">
+                                          <div className="text-xs text-slate-500">Pending</div>
+                                          <div className="font-bold text-white">{camp.topicManager.pendingTopics.length}</div>
+                                      </div>
+                                      <div className="text-center">
+                                          <div className="text-xs text-slate-500">Completed</div>
+                                          <div className="font-bold text-green-500">{camp.topicManager.completedTopics.length}</div>
+                                      </div>
+                                      <div className="text-center">
+                                          <div className="text-xs text-slate-500">Next Run</div>
+                                          <div className="font-bold text-blue-400">{camp.config.creationTime}</div>
+                                      </div>
                                   </div>
                               </div>
                           </div>
-                          <div className="flex items-center gap-3">
-                              <button 
-                                onClick={() => {
-                                    db.saveAutomation({...auto, isEnabled: !auto.isEnabled}).then(loadData);
-                                }}
-                                className={`p-2 rounded-full border ${auto.isEnabled ? 'bg-green-500/10 border-green-500/30 text-green-500' : 'bg-slate-800 border-slate-700 text-slate-500'}`}
-                              >
-                                  {auto.isEnabled ? <Pause size={20} /> : <Play size={20} />}
-                              </button>
-                              <button onClick={() => handleDelete(auto.id)} className="p-2 text-slate-600 hover:text-red-500 hover:bg-red-900/10 rounded-full transition">
+
+                          <div className="flex flex-col gap-2 justify-center w-full md:w-48 border-t md:border-t-0 md:border-r border-slate-800 md:pr-6 md:mr-2">
+                              <div className="flex justify-between text-xs text-slate-400 mb-1">
+                                  <span>Progress</span>
+                                  <span>{Math.round(progress)}%</span>
+                              </div>
+                              <div className="w-full bg-slate-950 rounded-full h-2 overflow-hidden">
+                                  <div className="bg-purple-600 h-full rounded-full" style={{ width: `${progress}%` }}></div>
+                              </div>
+                          </div>
+
+                          <div className="flex items-center gap-2">
+                              <button onClick={() => deleteCampaign(camp.id)} className="p-2 text-slate-500 hover:text-red-500 hover:bg-red-900/10 rounded-full">
                                   <Trash2 size={20} />
                               </button>
                           </div>
                       </div>
                   );
               })}
-              {automations.length === 0 && !loading && (
-                  <div className="text-center p-12 border border-dashed border-slate-800 rounded-xl">
-                      <Workflow size={48} className="mx-auto text-slate-700 mb-4" />
-                      <p className="text-slate-500">No automation pipelines active.</p>
+          </div>
+      )}
+
+      {/* 2. CAMPAIGN EDITOR MODAL */}
+      {isEditingCampaign && (
+          <div className="bg-slate-950 border border-slate-800 rounded-xl p-8 max-w-4xl mx-auto">
+              <div className="flex justify-between items-center mb-6 border-b border-slate-800 pb-4">
+                  <h3 className="text-xl font-bold text-white flex items-center gap-2">
+                      <Settings2 size={24} className="text-purple-500" />
+                      إعداد الحملة (Campaign Setup)
+                  </h3>
+                  <button onClick={() => setIsEditingCampaign(false)} className="text-slate-500 hover:text-white"><X size={24}/></button>
+              </div>
+
+              <div className="space-y-6">
+                  {/* Basic Info */}
+                  <div className="grid grid-cols-2 gap-4">
+                      <div>
+                          <label className="text-xs text-slate-500 block mb-2">اسم الحملة</label>
+                          <input 
+                              value={campaignConfig.name || ''}
+                              onChange={e => setCampaignConfig({...campaignConfig, name: e.target.value})}
+                              className="w-full bg-slate-900 border border-slate-700 rounded p-3 text-white"
+                              placeholder="مثال: حملة شورتات التاريخ - فبراير"
+                          />
+                      </div>
+                      <div>
+                          <label className="text-xs text-slate-500 block mb-2">القناة</label>
+                          <select 
+                              value={campaignConfig.channelId || ''}
+                              onChange={e => setCampaignConfig({...campaignConfig, channelId: e.target.value})}
+                              className="w-full bg-slate-900 border border-slate-700 rounded p-3 text-white"
+                          >
+                              <option value="">اختر قناة...</option>
+                              {channels.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                          </select>
+                      </div>
                   </div>
+
+                  {/* Settings */}
+                  <div className="grid grid-cols-3 gap-4 bg-slate-900 p-4 rounded-xl border border-slate-800">
+                      <div>
+                          <label className="text-xs text-slate-500 block mb-2">عدد الفيديوهات</label>
+                          <input 
+                              type="number"
+                              value={campaignConfig.config?.videosPerDay}
+                              onChange={e => setCampaignConfig({...campaignConfig, config: {...campaignConfig.config!, videosPerDay: parseInt(e.target.value)}})}
+                              className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-white"
+                          />
+                      </div>
+                      <div>
+                          <label className="text-xs text-slate-500 block mb-2">نوع التكرار</label>
+                          <select 
+                              value={campaignConfig.config?.recurrence}
+                              onChange={e => setCampaignConfig({...campaignConfig, config: {...campaignConfig.config!, recurrence: e.target.value as any}})}
+                              className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-white"
+                          >
+                              <option value="Daily">يومي (Daily)</option>
+                              <option value="Once">مرة واحدة (Once)</option>
+                          </select>
+                      </div>
+                      <div>
+                          <label className="text-xs text-slate-500 block mb-2">حالة النشر</label>
+                          <select 
+                              value={campaignConfig.config?.publishMode}
+                              onChange={e => setCampaignConfig({...campaignConfig, config: {...campaignConfig.config!, publishMode: e.target.value as any}})}
+                              className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-white"
+                          >
+                              <option value="Scheduled">Scheduled</option>
+                              <option value="Private">Private</option>
+                              <option value="Draft">Draft</option>
+                          </select>
+                      </div>
+                  </div>
+
+                  {/* Timing */}
+                  <div className="grid grid-cols-2 gap-4">
+                      <div>
+                          <label className="text-xs text-slate-500 block mb-2">وقت بدء الإنشاء (Creation Time)</label>
+                          <input 
+                              type="time"
+                              value={campaignConfig.config?.creationTime}
+                              onChange={e => setCampaignConfig({...campaignConfig, config: {...campaignConfig.config!, creationTime: e.target.value}})}
+                              className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white"
+                          />
+                          <p className="text-[10px] text-slate-500 mt-1">متى يبدأ السيرفر بتوليد الفيديوهات يومياً.</p>
+                      </div>
+                      <div>
+                          <label className="text-xs text-slate-500 block mb-2">أوقات النشر (Publish Times)</label>
+                          <div className="flex flex-wrap gap-2 p-2 bg-slate-900 border border-slate-700 rounded min-h-[42px]">
+                              {campaignConfig.config?.publishTimes?.map((t, i) => (
+                                  <span key={i} className="bg-slate-800 text-xs px-2 py-1 rounded border border-slate-600 flex items-center gap-1">
+                                      {t} <button onClick={() => {
+                                          const newTimes = campaignConfig.config!.publishTimes!.filter((_, idx) => idx !== i);
+                                          setCampaignConfig({...campaignConfig, config: {...campaignConfig.config!, publishTimes: newTimes}});
+                                      }}><X size={10}/></button>
+                                  </span>
+                              ))}
+                              <button onClick={() => {
+                                  const time = prompt("Add time (HH:MM)");
+                                  if(time) setCampaignConfig({...campaignConfig, config: {...campaignConfig.config!, publishTimes: [...campaignConfig.config!.publishTimes!, time]}});
+                              }} className="text-blue-400 text-xs hover:text-white">+ Add</button>
+                          </div>
+                      </div>
+                  </div>
+
+                  {/* Topic Manager */}
+                  <div className="border-t border-slate-800 pt-4">
+                      <div className="flex justify-between items-center mb-2">
+                          <label className="text-sm font-bold text-white flex items-center gap-2">
+                              <FileText size={16} className="text-blue-500" />
+                              قائمة المواضيع (Topic List)
+                          </label>
+                          <span className="text-xs text-slate-500">سيتم شطب المواضيع المستخدمة تلقائياً لمنع التكرار.</span>
+                      </div>
+                      <textarea 
+                          value={topicInput}
+                          onChange={e => setTopicInput(e.target.value)}
+                          placeholder="ألصق قائمة العناوين أو المواضيع هنا (كل موضوع في سطر مستقل)..."
+                          className="w-full h-40 bg-slate-900 border border-slate-700 rounded-xl p-4 text-sm text-slate-300 font-mono leading-relaxed focus:border-purple-500 outline-none"
+                      />
+                      <p className="text-xs text-slate-500 mt-2 text-right">
+                          عدد المواضيع المدخلة: {topicInput.split('\n').filter(t => t.trim()).length}
+                      </p>
+                  </div>
+
+                  <div className="flex justify-end pt-4 border-t border-slate-800">
+                      <button onClick={() => setIsEditingCampaign(false)} className="px-6 py-2 text-slate-400 hover:text-white">إلغاء</button>
+                      <button onClick={saveCampaign} className="px-6 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded font-bold flex items-center gap-2">
+                          <Save size={18} /> حفظ الحملة
+                      </button>
+                  </div>
+              </div>
+          </div>
+      )}
+
+      {/* 3. PIPELINE BUILDER VIEW (Existing) */}
+      {activeTab === 'pipelines' && isBuilding && (
+          <div className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden flex flex-col min-h-[600px]">
+              <div className="bg-slate-900 p-6 border-b border-slate-800"><StepsIndicator /></div>
+              <div className="flex-1 p-8 grid grid-cols-1 lg:grid-cols-3 gap-8">
+                  <div className="lg:col-span-2 order-2 lg:order-1">
+                      {renderStepContent()}
+                      {validationError && (<div className="mt-4 p-3 bg-red-900/20 border border-red-900/50 text-red-400 rounded flex items-center gap-2"><ShieldAlert size={18} /> {validationError}</div>)}
+                  </div>
+                  <div className="order-1 lg:order-2 space-y-6">
+                       <InlineCopilot title="Automation Architect" systemPrompt={COPILOT_SYSTEM_PROMPT} onAction={handleCopilotAction} compact />
+                  </div>
+              </div>
+              <div className="p-6 border-t border-slate-800 flex justify-between bg-slate-900">
+                  <button onClick={() => { setIsBuilding(false); setConfig({}); setActiveStep(1); }} className="px-6 py-2 text-slate-400 hover:text-white">Cancel</button>
+                  <div className="flex gap-3">
+                      <button onClick={() => setActiveStep(prev => Math.max(prev - 1, 1))} disabled={activeStep === 1} className="px-6 py-2 border border-slate-700 rounded text-slate-300 hover:bg-slate-800 disabled:opacity-50">Back</button>
+                      {activeStep < 8 ? (<button onClick={() => { if(validateStep(activeStep)) setActiveStep(prev => prev + 1); }} className="px-6 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded font-bold flex items-center gap-2">Next <ArrowRight size={18} /></button>) : (<button onClick={handleSave} className="px-6 py-2 bg-green-600 hover:bg-green-500 text-white rounded font-bold flex items-center gap-2"><Save size={18} /> Finish & Save</button>)}
+                  </div>
+              </div>
+          </div>
+      )}
+
+      {/* 4. PIPELINES LIST (Existing) */}
+      {activeTab === 'pipelines' && !isBuilding && (
+          <div className="grid grid-cols-1 gap-4">
+              {automations.map(auto => {
+                  const channel = channels.find(c => c.id === auto.channelId);
+                  return (
+                      <div key={auto.id} className="bg-slate-900 border border-slate-800 rounded-xl p-6 flex justify-between items-center group hover:border-slate-700 transition">
+                          <div className="flex items-center gap-4">
+                              <div className={`w-12 h-12 rounded-lg flex items-center justify-center text-xl font-bold ${auto.isEnabled ? 'bg-green-500/10 text-green-500' : 'bg-slate-800 text-slate-500'}`}>{channel?.name.charAt(0)}</div>
+                              <div><h3 className="font-bold text-white text-lg">{auto.name}</h3><div className="flex items-center gap-3 text-xs text-slate-400 mt-1"><span className="bg-slate-800 px-2 py-0.5 rounded">{auto.pipelineLine}</span><span>• {auto.specs.videosPerDay} videos/day</span></div></div>
+                          </div>
+                          <div className="flex items-center gap-3"><button onClick={() => { db.saveAutomation({...auto, isEnabled: !auto.isEnabled}).then(loadData); }} className={`p-2 rounded-full border ${auto.isEnabled ? 'bg-green-500/10 border-green-500/30 text-green-500' : 'bg-slate-800 border-slate-700 text-slate-500'}`}>{auto.isEnabled ? <Pause size={20} /> : <Play size={20} />}</button><button onClick={() => handleDelete(auto.id)} className="p-2 text-slate-600 hover:text-red-500 hover:bg-red-900/10 rounded-full transition"><Trash2 size={20} /></button></div>
+                      </div>
+                  );
+              })}
+          </div>
+      )}
+
+      {/* 5. LOGS VIEW */}
+      {activeTab === 'logs' && (
+          <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+              <div className="p-6 border-b border-slate-800 flex justify-between items-center">
+                  <h3 className="font-bold text-white flex items-center gap-2"><ListVideo className="text-blue-500" /> سجل الإنتاج اليومي</h3>
+                  <div className="text-xs text-slate-500 bg-slate-950 px-3 py-1 rounded-full border border-slate-800">{new Date().toLocaleDateString()}</div>
+              </div>
+              {todaysJobs.length === 0 ? <div className="p-10 text-center text-slate-500"><p>لا توجد عمليات إنتاج مسجلة لهذا اليوم.</p></div> : (
+                  <table className="w-full text-right text-sm">
+                      <thead className="bg-slate-950 text-slate-400 font-medium"><tr><th className="p-4">الوقت</th><th className="p-4">العنوان</th><th className="p-4">النوع</th><th className="p-4">التقدم</th><th className="p-4">حالة النشر</th></tr></thead>
+                      <tbody className="divide-y divide-slate-800">
+                          {todaysJobs.map(job => (
+                              <tr key={job.id} className="hover:bg-slate-800/50 transition">
+                                  <td className="p-4 text-slate-500 font-mono text-xs">{new Date(job.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</td>
+                                  <td className="p-4"><div className="font-medium text-slate-200">{job.title}</div><div className="text-[10px] text-slate-500">{job.id}</div></td>
+                                  <td className="p-4"><span className={`text-[10px] px-2 py-0.5 rounded border ${job.type === 'Shorts' ? 'bg-purple-900/20 text-purple-400 border-purple-900/50' : 'bg-blue-900/20 text-blue-400 border-blue-900/50'}`}>{job.type}</span></td>
+                                  <td className="p-4"><div className="flex items-center gap-2">{getStatusBadge(job.status)}<span className="text-xs text-slate-500 font-mono">{job.progress}%</span></div></td>
+                                  <td className="p-4">{getPublishStatus(job)}</td>
+                              </tr>
+                          ))}
+                      </tbody>
+                  </table>
               )}
           </div>
       )}

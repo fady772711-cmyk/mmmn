@@ -1,5 +1,5 @@
 
-import { Channel, ProviderConfig, VoicePreset, ProductionRun, AutomationConfig, DailyPlan, ProviderType, YouTubeAuthConfig, ProductionJob, SceneDefinition, AgentConfiguration, AgentRole, AuthSettings, AppSettings, AdminJob, DevelopmentTicket, AgentMetrics } from '../types';
+import { Channel, ProviderConfig, VoicePreset, ProductionRun, AutomationConfig, DailyPlan, ProviderType, YouTubeAuthConfig, ProductionJob, SceneDefinition, AgentConfiguration, AgentRole, AuthSettings, AppSettings, AdminJob, DevelopmentTicket, AgentMetrics, Campaign } from '../types';
 import { MOCK_CHANNELS, MOCK_JOBS } from './mockData';
 
 // Keys for localStorage
@@ -11,6 +11,7 @@ const KEYS = {
   AGENT_CONFIGS: 'av_agent_configs',
   RUNS: 'av_runs',
   AUTOMATIONS: 'av_automations_v2', 
+  CAMPAIGNS: 'av_campaigns', // New Key
   PLANS: 'av_daily_plans',
   YT_CONFIG: 'av_yt_config',
   GLOBAL_USAGE: 'av_global_usage',
@@ -18,10 +19,10 @@ const KEYS = {
   APP_SETTINGS: 'av_app_settings',
   ADMIN_JOBS: 'av_admin_jobs',
   DEV_TICKETS: 'av_dev_tickets',
-  METRICS: 'av_metrics' // New Key for KPI
+  METRICS: 'av_metrics' 
 };
 
-// Initial Seed Data (If DB is empty)
+// ... (Existing Seed Data)
 const SEED_PROVIDERS: ProviderConfig[] = [
   { 
       id: 'prov_1', 
@@ -30,7 +31,7 @@ const SEED_PROVIDERS: ProviderConfig[] = [
       providerId: 'gemini', 
       isEnabled: true, 
       status: 'operational',
-      apiKey: process.env.API_KEY, // Inject Key
+      apiKey: process.env.API_KEY, 
       models: ['gemini-3-pro-preview', 'gemini-3-flash-preview', 'gemini-2.5-flash']
   },
   { 
@@ -51,6 +52,8 @@ const SEED_VOICES: VoicePreset[] = [
   { id: 'voice_2', name: 'Layla (News)', providerId: 'prov_3', nativeVoiceId: 'layla_456', gender: 'Female', style: 'News', languageCode: 'ar-AE' }
 ];
 
+// ... (Rest of existing methods until Automation)
+
 export interface TokenUsageStats {
     promptTokens: number;
     responseTokens: number;
@@ -63,7 +66,7 @@ const PRICE_OUTPUT_PER_M = 0.30;
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-// --- IndexedDB Helper ---
+// --- IndexedDB Helper (Same as before) ---
 const DB_NAME = 'AutoVideoOS_DB';
 const STORE_JOBS = 'jobs';
 const DB_VERSION = 1;
@@ -125,6 +128,8 @@ class StorageService {
     }
   }
 
+  // ... (Previous Channel, Provider, Voice, AgentConfig methods remain identical)
+  
   // --- Channels ---
   async getChannels(): Promise<Channel[]> {
     await delay(100);
@@ -149,7 +154,6 @@ class StorageService {
     this.save(KEYS.CHANNELS, channels);
   }
 
-  // --- Providers ---
   async getProviders(): Promise<ProviderConfig[]> {
     await delay(100);
     return this.load<ProviderConfig>(KEYS.PROVIDERS, SEED_PROVIDERS);
@@ -164,7 +168,6 @@ class StorageService {
     this.save(KEYS.PROVIDERS, list);
   }
 
-  // --- Agent Configurations ---
   async getAgentConfigs(): Promise<AgentConfiguration[]> {
       return this.load<AgentConfiguration>(KEYS.AGENT_CONFIGS, []);
   }
@@ -182,7 +185,6 @@ class StorageService {
       this.save(KEYS.AGENT_CONFIGS, list);
   }
 
-  // --- Voices ---
   async getVoices(): Promise<VoicePreset[]> {
     await delay(100);
     return this.load<VoicePreset>(KEYS.VOICES, SEED_VOICES);
@@ -197,7 +199,7 @@ class StorageService {
     this.save(KEYS.VOICES, list);
   }
 
-  // --- Automations ---
+  // --- Automations (Legacy) ---
   async getAutomations(): Promise<AutomationConfig[]> {
       return this.load<AutomationConfig>(KEYS.AUTOMATIONS, []);
   }
@@ -215,7 +217,25 @@ class StorageService {
       this.save(KEYS.AUTOMATIONS, list.filter(a => a.id !== id));
   }
 
-  // --- Daily Plans ---
+  // --- CAMPAIGNS (NEW) ---
+  async getCampaigns(): Promise<Campaign[]> {
+      return this.load<Campaign>(KEYS.CAMPAIGNS, []);
+  }
+
+  async saveCampaign(campaign: Campaign): Promise<void> {
+      const list = await this.getCampaigns();
+      const index = list.findIndex(c => c.id === campaign.id);
+      if (index >= 0) list[index] = campaign;
+      else list.push(campaign);
+      this.save(KEYS.CAMPAIGNS, list);
+  }
+
+  async deleteCampaign(id: string): Promise<void> {
+      const list = await this.getCampaigns();
+      this.save(KEYS.CAMPAIGNS, list.filter(c => c.id !== id));
+  }
+
+  // --- Plans ---
   async getDailyPlans(): Promise<DailyPlan[]> {
       return this.load<DailyPlan>(KEYS.PLANS, []);
   }
@@ -227,12 +247,7 @@ class StorageService {
       this.save(KEYS.PLANS, filtered);
   }
 
-  // --- Runs ---
-  async getRuns(): Promise<ProductionRun[]> {
-    return this.load<ProductionRun>(KEYS.RUNS, []);
-  }
-
-  // --- Jobs ---
+  // --- Jobs (IDB) ---
   async getJobs(): Promise<ProductionJob[]> {
     try {
         const jobs = await idbGetAll<ProductionJob>(STORE_JOBS);
@@ -283,7 +298,7 @@ class StorageService {
       return list.find(j => j.id === id);
   }
 
-  // --- DEV TICKETS ---
+  // --- Tickets ---
   async getTickets(): Promise<DevelopmentTicket[]> {
       return this.load<DevelopmentTicket>(KEYS.DEV_TICKETS, []);
   }
@@ -296,7 +311,7 @@ class StorageService {
       this.save(KEYS.DEV_TICKETS, list);
   }
 
-  // --- KPI METRICS (NEW) ---
+  // --- Metrics ---
   async getAgentMetrics(): Promise<AgentMetrics[]> {
       return this.load<AgentMetrics>(KEYS.METRICS, []);
   }
@@ -330,7 +345,7 @@ class StorageService {
       localStorage.setItem(KEYS.GLOBAL_USAGE, JSON.stringify(updated));
   }
 
-  // --- Settings & Auth ---
+  // --- Settings ---
   async getAuthSettings(): Promise<AuthSettings> {
       const data = localStorage.getItem(KEYS.AUTH_SETTINGS);
       return data ? JSON.parse(data) : { enabled: false, lockAfterMinutes: 30 };

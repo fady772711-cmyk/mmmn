@@ -1,522 +1,546 @@
 
 import React, { useState, useEffect } from 'react';
-import { ProductionJob, JobStatus, AgentRole, ChannelType, DurationConfig, VisualConfig, StepControl, ManualInputs, ProductionStep, ProductionType } from '../types';
+import { ProductionJob, JobStatus, AgentRole, ProductionType, Channel, ProductionStep } from '../types';
+import { server } from '../services/serverOrchestrator';
 import { db } from '../services/storageService';
-import { server } from '../services/serverOrchestrator'; // The "Server"
-import { CheckCircle2, Circle, AlertCircle, Loader2, Play, Film, Video, Image as ImageIcon, Music, CheckSquare, Zap, Clock, Smartphone, MonitorPlay, FileText, Upload } from 'lucide-react';
-import InlineCopilot from '../components/InlineCopilot';
+import { assembleVideo } from '../services/videoAssembler'; 
+import { 
+    CheckCircle2, Circle, AlertCircle, Loader2, Play, 
+    MonitorPlay, Smartphone, Zap, Clock, DollarSign, 
+    ChevronRight, Type as TypeIcon, Music, Mic2, Sliders, Volume2, Film,
+    Eye, AlignLeft, Activity, ImageIcon, FileText, Download
+} from 'lucide-react';
 
-interface ProductionProps {
-  initialJobs?: ProductionJob[];
+// --- Components ---
+
+interface StepCardProps {
+    step: ProductionStep;
+    index: number;
+    job: ProductionJob;
 }
 
-const StatusIcon = ({ status }: { status: JobStatus }) => {
-  switch (status) {
-    case JobStatus.COMPLETED: return <CheckCircle2 className="text-green-500" size={20} />;
-    case JobStatus.RUNNING: return <Loader2 className="text-blue-500 animate-spin" size={20} />;
-    case JobStatus.FAILED: return <AlertCircle className="text-red-500" size={20} />;
-    case JobStatus.SKIPPED: return <CheckSquare className="text-slate-500" size={20} />;
-    case JobStatus.PENDING: default: return <Circle className="text-slate-600" size={20} />;
-  }
-};
-
-const Production: React.FC<ProductionProps> = () => {
-  const [jobs, setJobs] = useState<ProductionJob[]>([]);
-  const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
-  const [isRequesting, setIsRequesting] = useState(false);
-  const [loadingData, setLoadingData] = useState(true);
-  
-  // -- JOB CONFIGURATION FORM --
-  const [productionType, setProductionType] = useState<ProductionType>('Long');
-  const [newTopic, setNewTopic] = useState('');
-  const [durationInput, setDurationInput] = useState<number>(10);
-  
-  // Source Material (New)
-  const [sourceMaterial, setSourceMaterial] = useState('');
-  
-  // Visual Mode
-  const [visualMode, setVisualMode] = useState<'images' | 'video'>('images');
-  const [shortsProvider, setShortsProvider] = useState<'veo_3_1_fast' | 'veo_2'>('veo_3_1_fast');
-  
-  // Step Controls (Matrix)
-  const [stepControl, setStepControl] = useState<StepControl>({
-      title: 'agent', script: 'agent', scenes: 'agent', visuals: 'agent', voice: 'agent', music: 'auto', publish: 'manual'
-  });
-
-  const [manualTitle, setManualTitle] = useState('');
-  const [manualScript, setManualScript] = useState('');
-
-  // Update defaults
-  useEffect(() => {
-      if (productionType === 'Shorts') {
-          setDurationInput(45);
-          setVisualMode('video');
-      } else {
-          setDurationInput(10);
-          setVisualMode('images');
-      }
-  }, [productionType]);
-
-  // --- POLLING LOOP (Client polling Server) ---
-  useEffect(() => {
-      const fetchJobs = async () => {
-          const data = await db.getJobs();
-          // Simple sort by ID desc
-          const sorted = data.sort((a, b) => {
-              const timeA = parseInt(a.id.split('_')[1] || '0');
-              const timeB = parseInt(b.id.split('_')[1] || '0');
-              return timeB - timeA;
-          });
-          setJobs(sorted);
-          if (sorted.length > 0 && !selectedJobId) {
-              setSelectedJobId(sorted[0].id);
-          }
-          setLoadingData(false);
-      };
-
-      fetchJobs(); // Initial fetch
-      const interval = setInterval(fetchJobs, 3000); // Poll every 3 seconds
-
-      return () => clearInterval(interval);
-  }, [selectedJobId]);
-
-  const selectedJob = jobs.find(j => j.id === selectedJobId);
-
-  // --- FILE UPLOAD HANDLER ---
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
-
-      if (file.type === "text/plain") {
-          const reader = new FileReader();
-          reader.onload = (ev) => {
-              if (ev.target?.result) setSourceMaterial(ev.target.result as string);
-          };
-          reader.readAsText(file);
-      } else {
-          alert("حالياً ندعم الملفات النصية (.txt) فقط. يرجى نسخ المحتوى ولصقه إذا كان PDF.");
-      }
-  };
-
-  // --- COPILOT ACTION HANDLER ---
-  const handleCopilotAction = (action: string, payload: any) => {
-      if (action === 'configure_job') {
-          if (payload.topic) setNewTopic(payload.topic);
-          if (payload.type) setProductionType(payload.type);
-          if (payload.duration) setDurationInput(payload.duration);
-          if (payload.visualMode) setVisualMode(payload.visualMode);
-          if (payload.sourceNote) setSourceMaterial(prev => prev ? prev : `[Auto-Generated Notes from Link]:\n${payload.sourceNote}`);
-          
-          alert("تم ضبط إعدادات الفيديو بناءً على تحليل الرابط/الوصف.");
-      }
-  };
-
-  const PRODUCTION_COPILOT_PROMPT = `You are a Video Production Copilot.
-Your goal: Help the user configure a new job by "Reverse Engineering" their request.
-If the user provides a YouTube Link or a description of a video style, analyze it (simulate analysis) and output a configuration JSON.
-
-Trigger: When user says "Make a video like this [LINK]" or "Create a documentary about X like Channel Y".
-
-Action: 'configure_job'
-Payload: {
-  "topic": "The inferred topic",
-  "type": "Long" or "Shorts",
-  "duration": number (minutes for long, seconds for shorts),
-  "visualMode": "images" or "video" (based on complexity),
-  "sourceNote": "A summary of the style/structure derived from the user's input to be used as source material."
-}
-
-Example: "Make a 60s short about space like this link..." -> type: Shorts, duration: 60, visualMode: video.`;
-
-  // --- START JOB REQUEST ---
-  const handleStartRequest = async () => {
-    if (!newTopic) return;
-    setIsRequesting(true);
-
-    const isShorts = productionType === 'Shorts';
+const StepCard: React.FC<StepCardProps> = ({ step, index, job }) => {
+    const isActive = step.status === JobStatus.RUNNING;
+    const isDone = step.status === JobStatus.COMPLETED;
+    const [rendering, setRendering] = useState(false);
+    const [finalVideoUrl, setFinalVideoUrl] = useState<string | null>(null);
     
-    // 1. Prepare Config Payload
-    const durationConfig: DurationConfig = {
-        mode: 'fixed',
-        unit: isShorts ? 'seconds' : 'minutes',
-        target_value: durationInput,
-        target_minutes: isShorts ? 1 : durationInput
+    // --- Artifact Extraction ---
+    const titleArtifact = step.artifacts?.find(a => a.label.includes('Selected Title') || a.label.includes('Hook'));
+    const scriptArtifact = step.artifacts?.find(a => a.label.includes('Script') && a.type === 'text');
+    const imageArtifacts = step.artifacts?.filter(a => a.type === 'image') || [];
+    const audioArtifact = step.artifacts?.find(a => a.type === 'audio');
+    const mixArtifact = step.artifacts?.find(a => a.type === 'mix_config');
+    const mixData = mixArtifact && mixArtifact.content ? JSON.parse(mixArtifact.content) : null;
+
+    // --- RENDER LOGIC FOR ASSEMBLER ---
+    const handleRender = async () => {
+        setRendering(true);
+        try {
+            // 1. Gather Assets from previous steps
+            const visualsStep = job.steps.find(s => s.agentRole === 'VisualProducer');
+            const voiceStep = job.steps.find(s => s.agentRole === 'VoiceDirector');
+            const musicStep = job.steps.find(s => s.agentRole === 'MusicDirector');
+
+            // Parse Scenes
+            const scenesArtifact = visualsStep?.artifacts?.find(a => a.label.includes('JSON'));
+            const scenes = scenesArtifact ? JSON.parse(scenesArtifact.content || '[]') : [];
+
+            // Get Audio URLs
+            const voiceUrl = voiceStep?.artifacts?.find(a => a.type === 'audio')?.url;
+            const musicConfig = musicStep?.artifacts?.find(a => a.type === 'mix_config');
+            const musicUrl = musicConfig && musicConfig.content ? JSON.parse(musicConfig.content).trackUrl : null;
+
+            if (scenes.length === 0) throw new Error("No scenes found to render");
+
+            // 2. Call Assembler
+            const blob = await assembleVideo(
+                scenes,
+                job.type === 'Shorts' ? '9:16' : '16:9',
+                voiceUrl,
+                musicUrl,
+                -15 // Ducking level
+            );
+
+            // 3. Show Result
+            const url = URL.createObjectURL(blob);
+            setFinalVideoUrl(url);
+
+        } catch (e: any) {
+            alert("Rendering Failed: " + e.message);
+            console.error(e);
+        } finally {
+            setRendering(false);
+        }
     };
 
-    const visualConfig: VisualConfig = {
-        mode: isShorts ? 'video' : (visualMode === 'video' ? 'video' : 'images'),
-        provider: isShorts ? shortsProvider : (visualMode === 'video' ? 'veo_3_1_fast' : 'nano_banana'),
-        fallback: isShorts ? 'veo_2' : 'images',
-        quality: 'standard',
-        aspectRatio: isShorts ? '9:16' : '16:9'
-    };
+    return (
+        <div className={`relative bg-slate-900 border rounded-xl p-6 mb-6 transition-all duration-300 group ${
+            isActive ? 'border-blue-500 shadow-[0_0_20px_rgba(59,130,246,0.15)] ring-1 ring-blue-500/30' : 
+            isDone ? 'border-slate-800 opacity-100 hover:border-slate-700' : 'border-slate-800 opacity-60'
+        }`}>
+            {/* Header Section */}
+            <div className="flex justify-between items-start mb-4">
+                <div className="flex items-center gap-4">
+                    {/* Status Icon */}
+                    <div className={`w-10 h-10 rounded-full border-2 flex items-center justify-center shrink-0 ${
+                        isDone ? 'border-green-500 bg-green-500/10 text-green-500' :
+                        isActive ? 'border-blue-500 bg-blue-500/10 text-blue-500 animate-pulse' :
+                        'border-slate-700 bg-slate-800 text-slate-500'
+                    }`}>
+                        {isDone ? <CheckCircle2 size={20} /> : 
+                         isActive ? <Loader2 size={20} className="animate-spin" /> : 
+                         <span className="font-mono text-xs">{index + 1}</span>}
+                    </div>
 
-    // 2. Define Pipeline (Client defines WHAT, Server defines HOW)
-    const pipelineSteps: ProductionStep[] = [];
-    if (isShorts) {
-        pipelineSteps.push(
-            { id: 'sh1', agentRole: AgentRole.HOOK_MAKER, name: '1. Viral Hook Strategy', status: JobStatus.PENDING, retryCount: 0 },
-            { id: 'sh2', agentRole: AgentRole.TITLE_OPTIMIZER, name: '2. Title Gen', status: JobStatus.PENDING, retryCount: 0 },
-            { id: 'sh3', agentRole: AgentRole.TITLE_SELECTOR, name: '3. Title Select', status: JobStatus.PENDING, retryCount: 0 },
-            { id: 'sh4', agentRole: AgentRole.MICRO_SCRIPT_BUILDER, name: '4. Micro Scripting', status: JobStatus.PENDING, retryCount: 0 },
-            { id: 'sh5', agentRole: AgentRole.PACING_REVIEWER, name: '5. Pacing Check', status: JobStatus.PENDING, retryCount: 0 },
-            { id: 'sh6', agentRole: AgentRole.SCENE_PLANNER, name: '6. Shot Planning', status: JobStatus.PENDING, retryCount: 0 },
-            { id: 'sh7', agentRole: AgentRole.VISUAL_PRODUCER, name: '7. Vertical Visuals', status: JobStatus.PENDING, retryCount: 0 },
-            { id: 'sh8', agentRole: AgentRole.VOICE_DIRECTOR, name: '8. Voiceover', status: JobStatus.PENDING, retryCount: 0 }
-        );
-        if (stepControl.music === 'auto') {
-            pipelineSteps.push({ id: 'shM', agentRole: AgentRole.MUSIC_DIRECTOR, name: 'Music Selection', status: JobStatus.PENDING, retryCount: 0 });
-        }
-        pipelineSteps.push(
-            { id: 'sh9', agentRole: AgentRole.EDITOR_ASSEMBLER, name: '9. Vertical Assembly', status: JobStatus.PENDING, retryCount: 0 },
-            { id: 'sh10', agentRole: AgentRole.QA_REVIEWER, name: '10. Shorts QA', status: JobStatus.PENDING, retryCount: 0 }
-        );
-    } else {
-        // Long Form Pipeline Definition
-        if (stepControl.title === 'agent') {
-            pipelineSteps.push(
-                { id: 's1', agentRole: AgentRole.STRATEGY_DIRECTOR, name: '1. Strategy', status: JobStatus.PENDING, retryCount: 0 },
-                { id: 's2', agentRole: AgentRole.TITLE_OPTIMIZER, name: '2. Title Gen', status: JobStatus.PENDING, retryCount: 0 },
-                { id: 's3', agentRole: AgentRole.TITLE_SELECTOR, name: '3. Title Select', status: JobStatus.PENDING, retryCount: 0 }
-            );
-        } else {
-            pipelineSteps.push({ id: 'm1', agentRole: AgentRole.TITLE_SELECTOR, name: 'Manual Title', status: JobStatus.SKIPPED, outputSummary: 'Manual Input', retryCount: 0 });
-        }
-
-        if (stepControl.script === 'agent') {
-            pipelineSteps.push(
-                { id: 's4', agentRole: AgentRole.STRUCTURE_AGENT, name: '4. Structure', status: JobStatus.PENDING, retryCount: 0 },
-                { id: 's5', agentRole: AgentRole.SCRIPT_BUILDER, name: '5. Scripting', status: JobStatus.PENDING, retryCount: 0 },
-                { id: 's6', agentRole: AgentRole.PACING_REVIEWER, name: '6. Pacing', status: JobStatus.PENDING, retryCount: 0 }
-            );
-        } else {
-             pipelineSteps.push({ id: 'm2', agentRole: AgentRole.PACING_REVIEWER, name: 'Manual Script', status: JobStatus.SKIPPED, outputSummary: 'Manual Input', retryCount: 0 });
-        }
-
-        pipelineSteps.push(
-            { id: 's7', agentRole: AgentRole.SCENE_PLANNER, name: '7. Scene Plan', status: JobStatus.PENDING, retryCount: 0 },
-            { id: 's8', agentRole: AgentRole.VISUAL_PRODUCER, name: '8. Visuals', status: JobStatus.PENDING, retryCount: 0 },
-            { id: 's9', agentRole: AgentRole.VOICE_DIRECTOR, name: '9. Voiceover', status: JobStatus.PENDING, retryCount: 0 }
-        );
-
-        if (stepControl.music === 'auto') {
-            pipelineSteps.push({ id: 'sM', agentRole: AgentRole.MUSIC_DIRECTOR, name: 'Music Selection', status: JobStatus.PENDING, retryCount: 0 });
-        }
-
-        pipelineSteps.push(
-            { id: 's10', agentRole: AgentRole.EDITOR_ASSEMBLER, name: '10. Editing', status: JobStatus.PENDING, retryCount: 0 },
-            { id: 's11', agentRole: AgentRole.QA_REVIEWER, name: '11. QA', status: JobStatus.PENDING, retryCount: 0 }
-        );
-    }
-
-    // 3. Send Request to Server
-    try {
-        const jobId = await server.startJob({
-            title: stepControl.title === 'manual' ? manualTitle : newTopic,
-            type: productionType,
-            steps: pipelineSteps,
-            durationConfig,
-            visualConfig,
-            stepControl,
-            manualInputs: { 
-                title: manualTitle, 
-                script: manualScript,
-                sourceMaterial: sourceMaterial // Pass uploaded content
-            }
-        });
-
-        // UI Updates immediately
-        setNewTopic('');
-        setSourceMaterial('');
-        setSelectedJobId(jobId);
-    } catch (e: any) {
-        alert("Server Error: " + e.message);
-    } finally {
-        setIsRequesting(false);
-    }
-  };
-
-  return (
-    <div className="flex h-[calc(100vh-80px)] -m-6">
-      {/* Job List & Config */}
-      <div className="w-1/3 border-l border-slate-800 flex flex-col">
-        <div className="p-4 border-b border-slate-800 bg-slate-900">
-          <h3 className="font-bold text-white mb-4">إنشاء مهمة (Send to Server)</h3>
-          
-          <div className="space-y-4 bg-slate-950/50 p-4 rounded-xl border border-slate-800 h-[600px] overflow-y-auto custom-scrollbar">
-            {/* 1. Type */}
-            <div>
-                 <label className="text-xs text-slate-500 font-bold mb-1 block">Production Type</label>
-                 <div className="flex bg-slate-900 rounded p-1 border border-slate-700 mb-3">
-                    <button 
-                        onClick={() => setProductionType('Long')} 
-                        className={`flex-1 text-xs py-1.5 rounded flex items-center justify-center gap-1 ${productionType === 'Long' ? 'bg-blue-600 text-white' : 'text-slate-400'}`}
-                    >
-                        <MonitorPlay size={12} /> Long Video
-                    </button>
-                    <button 
-                         onClick={() => setProductionType('Shorts')} 
-                         className={`flex-1 text-xs py-1.5 rounded flex items-center justify-center gap-1 ${productionType === 'Shorts' ? 'bg-purple-600 text-white' : 'text-slate-400'}`}
-                    >
-                        <Smartphone size={12} /> Shorts (9:16)
-                    </button>
+                    <div>
+                        <h3 className={`text-lg font-bold ${isActive ? 'text-blue-400' : 'text-slate-200'}`}>
+                            {step.name}
+                        </h3>
+                        <p className="text-[10px] text-slate-500 font-mono uppercase tracking-widest flex items-center gap-2">
+                            {step.agentRole.replace('Director', '').replace('Builder', '').replace('Producer', '')} AGENT
+                            {step.tokenUsage && <span className="text-amber-600">• {step.tokenUsage.total} tokens</span>}
+                        </p>
+                    </div>
                 </div>
-
-                <label className="text-xs text-slate-500 font-bold mb-1 block">Topic</label>
-                <input 
-                    type="text" 
-                    placeholder="Enter video topic..." 
-                    value={newTopic}
-                    onChange={(e) => setNewTopic(e.target.value)}
-                    className="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-white focus:border-blue-500 outline-none"
-                />
             </div>
 
-            {/* Source Material Input (Long Form Only) */}
-            {productionType === 'Long' && (
-                <div className="space-y-2 pt-2 border-t border-slate-800">
-                    <label className="text-xs text-slate-500 font-bold block flex items-center gap-2">
-                        <FileText size={12} /> مادة مصدرية (نص/قصة)
-                    </label>
-                    <div className="relative">
-                        <textarea 
-                            value={sourceMaterial}
-                            onChange={(e) => setSourceMaterial(e.target.value)}
-                            placeholder="الصق نص القصة أو المقالة هنا لاستخدامها كمصدر..."
-                            className="w-full h-24 bg-slate-900 border border-slate-700 rounded px-3 py-2 text-xs text-slate-300 focus:border-blue-500 outline-none resize-none"
-                        />
-                        <div className="absolute bottom-2 left-2">
-                            <input 
-                                type="file" 
-                                id="source-upload" 
-                                className="hidden" 
-                                accept=".txt" 
-                                onChange={handleFileUpload} 
-                            />
-                            <label 
-                                htmlFor="source-upload" 
-                                className="flex items-center gap-1 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white px-2 py-1 rounded text-[10px] cursor-pointer transition border border-slate-700"
-                            >
-                                <Upload size={10} /> رفع ملف (.txt)
-                            </label>
+            {/* --- RICH CONTENT AREA (THE ARTIFACTS) --- */}
+            
+            {/* 1. TITLE / HOOK DISPLAY */}
+            {titleArtifact && (
+                <div className="mt-2 bg-gradient-to-r from-blue-900/20 to-transparent border-r-4 border-blue-500 p-4 rounded-l-lg animate-in fade-in slide-in-from-right-4">
+                    <div className="text-[10px] text-blue-400 uppercase font-bold mb-1">العنوان المختار (Title/Hook)</div>
+                    <div className="text-xl font-bold text-white leading-tight">
+                        "{titleArtifact.content}"
+                    </div>
+                </div>
+            )}
+
+            {/* 2. SCRIPT DISPLAY */}
+            {scriptArtifact && (
+                <div className="mt-4 animate-in fade-in slide-in-from-bottom-2">
+                    <div className="flex items-center gap-2 text-xs text-slate-400 mb-2">
+                        <FileText size={14} className="text-slate-500" />
+                        <span className="font-bold">النص المولد (Generated Script)</span>
+                    </div>
+                    <div className="bg-slate-950/50 border border-slate-800 rounded-lg p-4 text-sm text-slate-300 font-serif leading-relaxed whitespace-pre-wrap max-h-48 overflow-y-auto custom-scrollbar shadow-inner text-right" dir="rtl">
+                        {scriptArtifact.content}
+                    </div>
+                </div>
+            )}
+
+            {/* 3. VISUALS (IMAGES GRID) */}
+            {imageArtifacts.length > 0 && (
+                <div className="mt-4 animate-in fade-in slide-in-from-bottom-2">
+                    <div className="flex items-center gap-2 text-xs text-slate-400 mb-2">
+                        <ImageIcon size={14} className="text-pink-500" />
+                        <span className="font-bold">المشاهد المولدة (Generated Scenes)</span>
+                    </div>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                        {imageArtifacts.map((img, i) => (
+                            <div key={i} className="group relative aspect-video bg-black rounded-lg overflow-hidden border border-slate-700">
+                                <img src={img.url} alt={`Scene ${i}`} className="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition duration-500 hover:scale-110" />
+                                <div className="absolute bottom-0 left-0 right-0 bg-black/60 text-[9px] text-white p-1 text-center backdrop-blur-sm">
+                                    Scene {i + 1}
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
+
+            {/* 4. VOICE / AUDIO PLAYER */}
+            {audioArtifact && (
+                <div className="mt-4 bg-slate-950 border border-slate-800 rounded-xl p-3 flex items-center gap-4 animate-in fade-in">
+                    <div className="w-10 h-10 bg-amber-500/10 rounded-full flex items-center justify-center text-amber-500 shrink-0">
+                        <Mic2 size={20} />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                        <div className="text-[10px] text-slate-500 font-bold uppercase mb-1">التعليق الصوتي (Voiceover)</div>
+                        <audio controls src={audioArtifact.url} className="w-full h-8 opacity-80 hover:opacity-100 transition" />
+                    </div>
+                </div>
+            )}
+
+            {/* 5. MUSIC MIXING DISPLAY */}
+            {mixData && (
+                <div className="mt-4 bg-purple-900/10 border border-purple-900/30 rounded-lg p-4 animate-in fade-in">
+                    <div className="flex justify-between items-center mb-3 border-b border-purple-900/30 pb-2">
+                        <div className="flex items-center gap-2">
+                            <Music size={16} className="text-purple-400" />
+                            <span className="text-xs font-bold text-purple-300">الموسيقى المختارة (Backing Track)</span>
+                        </div>
+                        <span className="text-[10px] text-white bg-purple-900/50 px-2 py-0.5 rounded">{mixData.bpm} BPM</span>
+                    </div>
+                    <div className="flex justify-between items-end">
+                        <div>
+                            <div className="text-sm text-white font-bold">{mixData.track}</div>
+                            <div className="text-xs text-slate-400 mt-0.5">{mixData.mood}</div>
+                        </div>
+                        <div className="flex gap-2 text-[10px] text-slate-500 font-mono">
+                            <span className="bg-slate-900 px-2 py-1 rounded">Ducking: {mixData.mix.ducking}</span>
+                            <span className="bg-slate-900 px-2 py-1 rounded">Vol: {mixData.mix.music_volume_db || '-18'}dB</span>
                         </div>
                     </div>
                 </div>
             )}
 
-            {/* 2. Controls */}
-            <div className="grid grid-cols-2 gap-3">
-                <div>
-                    <label className="text-xs text-slate-500 font-bold mb-1 block">Visuals</label>
-                    <div className="flex bg-slate-900 rounded p-1 border border-slate-700">
-                         {productionType === 'Shorts' ? (
-                            <span className="text-[10px] text-purple-400 px-2 py-1">Locked: Video</span>
-                         ) : (
-                            <>
-                                <button onClick={() => setVisualMode('images')} className={`flex-1 text-[10px] py-1 rounded ${visualMode === 'images' ? 'bg-slate-700 text-white' : 'text-slate-500'}`}>Images</button>
-                                <button onClick={() => setVisualMode('video')} className={`flex-1 text-[10px] py-1 rounded ${visualMode === 'video' ? 'bg-blue-600 text-white' : 'text-slate-500'}`}>Veo</button>
-                            </>
-                         )}
+            {/* 6. ASSEMBLY / FINAL VIDEO */}
+            {step.agentRole === 'EditorAssembler' && isDone && (
+                <div className="mt-6 border-t border-slate-800 pt-4 animate-in fade-in slide-in-from-bottom-4">
+                    <div className="flex items-center gap-2 text-xs text-slate-400 mb-3">
+                        <Film size={14} className="text-red-500" />
+                        <span className="font-bold">الدمج النهائي (Final Assembly)</span>
                     </div>
-                </div>
-                <div>
-                    <label className="text-xs text-slate-500 font-bold mb-1 block">Duration</label>
-                    <input type="number" value={durationInput} onChange={e => setDurationInput(parseInt(e.target.value))} className="w-full bg-slate-900 border border-slate-700 rounded p-1 text-center text-sm text-white"/>
-                </div>
-            </div>
-
-            {/* 3. Inline Copilot for Reverse Engineering */}
-            <div className="pt-2 border-t border-slate-800">
-                <InlineCopilot 
-                    title="Production Copilot"
-                    subtitle="ضع رابط يوتيوب لنسخ الأسلوب"
-                    placeholder="مثال: اصنع فيديو مثل هذا الرابط..."
-                    systemPrompt={PRODUCTION_COPILOT_PROMPT}
-                    onAction={handleCopilotAction}
-                    compact
-                />
-            </div>
-
-            <button 
-                onClick={handleStartRequest}
-                disabled={isRequesting || !newTopic}
-                className="w-full bg-blue-600 hover:bg-blue-500 text-white py-2.5 rounded-lg flex items-center justify-center gap-2 font-bold disabled:opacity-50 disabled:cursor-not-allowed transition"
-            >
-                {isRequesting ? <Loader2 className="animate-spin" size={18}/> : <Play size={18}/>}
-                <span>Start Server Job</span>
-            </button>
-          </div>
-        </div>
-        
-        {/* Jobs List (Read Only) */}
-        <div className="overflow-y-auto flex-1 bg-slate-950/50">
-          {loadingData ? (
-             <div className="text-center p-4 text-slate-500 text-sm">جاري جلب البيانات من السيرفر...</div>
-          ) : (
-            jobs.map(job => (
-                <div 
-                key={job.id}
-                onClick={() => setSelectedJobId(job.id)}
-                className={`p-4 border-b border-slate-800 cursor-pointer hover:bg-slate-900 transition ${selectedJobId === job.id ? 'bg-slate-900 border-r-4 border-r-blue-500' : ''}`}
-                >
-                <div className="flex justify-between items-start mb-1">
-                    <h4 className="font-medium text-slate-200 line-clamp-1">{job.title}</h4>
-                    <StatusIcon status={job.status} />
-                </div>
-                <div className="flex justify-between items-center mt-2">
-                    <div className="flex gap-2">
-                        {job.type === 'Shorts' ? (
-                            <span className="text-[10px] bg-purple-900/30 text-purple-400 border border-purple-800 px-1 rounded flex items-center gap-1">
-                                <Smartphone size={8} /> Shorts
-                            </span>
-                        ) : (
-                            <span className="text-[10px] bg-blue-900/30 text-blue-400 border border-blue-800 px-1 rounded flex items-center gap-1">
-                                <MonitorPlay size={8} /> Long
-                            </span>
-                        )}
-                        {job.manualInputs?.sourceMaterial && (
-                            <span className="text-[10px] bg-slate-800 text-slate-400 border border-slate-700 px-1 rounded flex items-center gap-1">
-                                <FileText size={8} /> Source
-                            </span>
-                        )}
-                    </div>
-                    {/* Progress Bar based on completed steps */}
-                    <div className="w-16 h-1 bg-slate-800 rounded-full overflow-hidden">
-                        <div 
-                            className={`h-full ${job.status === JobStatus.FAILED ? 'bg-red-500' : 'bg-green-500'}`} 
-                            style={{ width: `${(job.steps.filter(s => s.status === JobStatus.COMPLETED).length / job.steps.length) * 100}%` }}
-                        ></div>
-                    </div>
-                </div>
-                </div>
-            ))
-          )}
-        </div>
-      </div>
-
-      {/* Pipeline View (Read Only) */}
-      <div className="w-2/3 bg-slate-950 flex flex-col">
-        {selectedJob ? (
-          <>
-            <div className="p-6 border-b border-slate-800 flex justify-between items-center bg-slate-900">
-              <div>
-                <h2 className="text-xl font-bold text-white flex items-center gap-2">
-                    {selectedJob.title}
-                    {selectedJob.status === JobStatus.RUNNING && <span className="text-xs bg-blue-600 px-2 py-0.5 rounded text-white animate-pulse">Processing on Server...</span>}
-                </h2>
-                <div className="flex gap-4 mt-1 text-sm text-slate-400">
-                    <span className="font-mono">ID: {selectedJob.id}</span>
-                    {selectedJob.durationConfig && (
-                        <span className="flex items-center gap-1 text-blue-400 bg-blue-400/10 px-2 rounded-full text-xs">
-                            <Clock size={12} /> {selectedJob.durationConfig.target_value} {selectedJob.durationConfig.unit}
-                        </span>
+                    
+                    {!finalVideoUrl ? (
+                        <button 
+                            onClick={handleRender} 
+                            disabled={rendering}
+                            className="w-full bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 py-4 rounded-xl font-bold flex items-center justify-center gap-3 transition shadow-lg group-hover:shadow-blue-900/10"
+                        >
+                            {rendering ? <Loader2 className="animate-spin text-blue-500" /> : <Play fill="currentColor" className="text-blue-500" />}
+                            <span>بناء ومعاينة الفيديو (Render Video)</span>
+                        </button>
+                    ) : (
+                        <div className="space-y-3">
+                            <div className="rounded-xl overflow-hidden border border-slate-700 bg-black shadow-2xl">
+                                <video src={finalVideoUrl} controls autoPlay className="w-full max-h-[400px]" />
+                            </div>
+                            <div className="flex justify-between items-center">
+                                <span className="text-xs text-green-500 font-mono flex items-center gap-1">
+                                    <CheckCircle2 size={12} /> Render Complete
+                                </span>
+                                <a 
+                                    href={finalVideoUrl} 
+                                    download={`video_${job.id}.webm`}
+                                    className="flex items-center gap-2 text-xs bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg transition"
+                                >
+                                    <Download size={14} /> تحميل الفيديو
+                                </a>
+                            </div>
+                        </div>
                     )}
                 </div>
-              </div>
-            </div>
-
-            <div className="flex-1 overflow-y-auto p-8">
-              <div className="relative">
-                <div className="absolute top-4 bottom-4 right-5 w-0.5 bg-slate-800"></div>
-
-                <div className="space-y-8">
-                  {selectedJob.steps.map((step, idx) => {
-                    const isCurrent = idx === selectedJob.currentStepIndex;
-
-                    return (
-                      <div key={step.id} className="relative flex gap-6 pr-2">
-                        {/* Status Bubble */}
-                        <div className={`relative z-10 w-10 h-10 rounded-full flex items-center justify-center border-2 bg-slate-950 transition-colors ${
-                          isCurrent ? 'border-blue-500 text-blue-500 shadow-[0_0_15px_rgba(59,130,246,0.5)]' :
-                          step.status === JobStatus.COMPLETED ? 'border-green-500 text-green-500 bg-green-500/10' :
-                          step.status === JobStatus.FAILED ? 'border-red-500 text-red-500' :
-                          'border-slate-700 text-slate-700'
-                        }`}>
-                          <StatusIcon status={step.status} />
-                        </div>
-
-                        {/* Content */}
-                        <div className={`flex-1 rounded-xl border p-5 transition-all ${
-                          isCurrent ? 'bg-slate-900 border-blue-500/30' : 
-                          'bg-slate-900/50 border-slate-800'
-                        }`}>
-                          <div className="flex justify-between items-start mb-2">
-                            <div>
-                                <h4 className={`font-bold text-lg ${isCurrent ? 'text-blue-400' : 'text-slate-300'}`}>{step.name}</h4>
-                                <p className="text-xs text-slate-500 uppercase tracking-wide">Server Agent: {step.agentRole}</p>
-                            </div>
-                            <div className="flex items-center gap-3">
-                                {step.tokenUsage && (
-                                    <div className="flex items-center gap-1 text-[10px] text-slate-500 bg-slate-950 px-2 py-1 rounded border border-slate-800">
-                                        <Zap size={10} className="text-amber-500" />
-                                        <span>{step.tokenUsage.total.toLocaleString()}</span>
-                                    </div>
-                                )}
-                            </div>
-                          </div>
-
-                          {/* Artifacts Display (Fetching from Server DB) */}
-                          <div className="mt-4 space-y-4">
-                              {/* Only show artifacts if step completed */}
-                              {step.status === JobStatus.COMPLETED && (
-                                  <>
-                                      {/* Titles */}
-                                      {(step.agentRole === AgentRole.TITLE_SELECTOR || step.agentRole === AgentRole.HOOK_MAKER) && selectedJob.artifacts.selectedTitle && (
-                                          <div className="bg-blue-900/10 border border-blue-900/50 p-4 rounded-lg">
-                                              <p className="text-sm font-bold text-blue-400 mb-1">Generated Title</p>
-                                              <h3 className="text-xl font-bold text-white">{selectedJob.artifacts.selectedTitle.selected_title}</h3>
-                                          </div>
-                                      )}
-                                      {/* Script */}
-                                      {(step.agentRole === AgentRole.PACING_REVIEWER || step.agentRole === AgentRole.MICRO_SCRIPT_BUILDER) && selectedJob.artifacts.refinedScript && (
-                                          <div className="bg-slate-950 p-4 rounded border border-slate-800 text-slate-400 text-sm max-h-32 overflow-y-auto">
-                                              {selectedJob.artifacts.refinedScript}
-                                          </div>
-                                      )}
-                                      {/* Visuals */}
-                                      {step.agentRole === AgentRole.VISUAL_PRODUCER && selectedJob.artifacts.scenesWithImages && (
-                                        <div className="grid grid-cols-4 gap-2">
-                                            {(selectedJob.artifacts.scenesWithImages as any[]).map((s, i) => (
-                                                <div key={i} className={`bg-slate-950 rounded overflow-hidden relative group border border-slate-800 ${selectedJob.type === 'Shorts' ? 'aspect-[9/16]' : 'aspect-video'}`}>
-                                                    {s.mediaType === 'video' ? (
-                                                        <video src={s.generatedVideoUrl} className="w-full h-full object-cover" muted autoPlay loop />
-                                                    ) : (
-                                                        <img src={s.generatedImageUrl} alt="" className="w-full h-full object-cover" />
-                                                    )}
-                                                </div>
-                                            ))}
-                                        </div>
-                                      )}
-                                      {/* Final Video */}
-                                      {step.agentRole === AgentRole.EDITOR_ASSEMBLER && selectedJob.artifacts.finalVideoUrl && (
-                                          <div className="mt-4 flex justify-center">
-                                              <video controls className={`rounded-lg bg-black border border-slate-700 ${selectedJob.type === 'Shorts' ? 'w-1/3' : 'w-full'}`} src={selectedJob.artifacts.finalVideoUrl} />
-                                          </div>
-                                      )}
-                                  </>
-                              )}
-                          </div>
-
-                           {step.errorMessage && (
-                            <div className="mt-3 p-3 bg-red-900/20 border border-red-900/50 rounded text-red-400 text-sm">
-                                Server Error: {step.errorMessage}
-                            </div>
-                           )}
-                        </div>
-                      </div>
-                    );
-                  })}
+            )}
+            
+            {/* Fallback Summary */}
+            {!titleArtifact && !scriptArtifact && imageArtifacts.length === 0 && !audioArtifact && !mixData && !finalVideoUrl && step.outputSummary && step.agentRole !== 'EditorAssembler' && (
+                <div className="mt-3 text-xs text-slate-400 bg-slate-950/50 p-2 rounded border border-slate-800/50 inline-block">
+                    {step.outputSummary}
                 </div>
-              </div>
+            )}
+        </div>
+    );
+};
+
+const Production: React.FC = () => {
+  const [channels, setChannels] = useState<Channel[]>([]);
+  const [selectedJob, setSelectedJob] = useState<ProductionJob | null>(null);
+  const [isRequesting, setIsRequesting] = useState(false);
+
+  // Form State
+  const [channelId, setChannelId] = useState('');
+  const [prodType, setProdType] = useState<ProductionType>('Long');
+  const [topic, setTopic] = useState('');
+  const [videoType, setVideoType] = useState('قصصي (Story)');
+  const [llmModel, setLlmModel] = useState('Gemini 2.0 Flash');
+  const [duration, setDuration] = useState(10);
+  const [visualMode, setVisualMode] = useState('Images');
+  const [musicMode, setMusicMode] = useState('Auto Mix');
+  const [voiceMode, setVoiceMode] = useState('وكيل'); 
+  const [textOverlay, setTextOverlay] = useState('تشغيل');
+  
+  // Style Settings
+  const [textStyle, setTextStyle] = useState('Cinematic');
+  const [textLines, setTextLines] = useState(2);
+  const [textSize, setTextSize] = useState('Large');
+
+  useEffect(() => {
+      const init = async () => {
+          const chans = await db.getChannels();
+          setChannels(chans);
+          if (chans.length > 0) setChannelId(chans[0].id);
+      };
+      init();
+
+      // Poll for active job
+      const poll = async () => {
+          try {
+              const response = await fetch('/api/jobs');
+              if (response.ok) {
+                  const data = await response.json();
+                  if (data.length > 0) {
+                      const latest = data.sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
+                      setSelectedJob(latest);
+                  }
+              }
+          } catch (e) { console.error(e); }
+      };
+      poll();
+      const interval = setInterval(poll, 2000);
+      return () => clearInterval(interval);
+  }, []);
+
+  const handleStartRun = async (overrideTopic?: string) => {
+      const finalTopic = overrideTopic || topic;
+      if (!finalTopic) return alert("Please enter a topic");
+      
+      setIsRequesting(true);
+      const payload: Partial<ProductionJob> = {
+          title: finalTopic,
+          type: prodType,
+          channelId,
+          videoType,
+          llmModel,
+          durationConfig: { mode: 'fixed', unit: 'minutes', target_value: duration },
+          visualConfig: { 
+              mode: visualMode === 'Images' ? 'images' : 'video',
+              provider: 'nano_banana',
+              fallback: 'images',
+              quality: 'standard',
+              aspectRatio: prodType === 'Shorts' ? '9:16' : '16:9',
+              textOverlay: { 
+                  enabled: textOverlay === 'تشغيل',
+                  style: textStyle as any,
+                  lines: textLines as any,
+                  size: textSize as any
+              }
+          },
+          musicMode: musicMode === 'Auto Mix' ? 'Auto Mix' : 'Off',
+          voiceMode: voiceMode === 'وكيل' ? 'Agent' : 'Auto'
+      };
+
+      try {
+          await server.startJob(payload);
+          setTopic('');
+      } catch (e: any) {
+          alert("Error: " + e.message);
+      } finally {
+          setIsRequesting(false);
+      }
+  };
+
+  return (
+    <div className="flex h-[calc(100vh-80px)] -m-6 bg-slate-950 font-sans text-slate-200 overflow-hidden" dir="rtl">
+        
+        {/* RIGHT SIDE: Production Control Form */}
+        <div className="w-[420px] bg-slate-900/50 border-l border-slate-800 flex flex-col z-10 shadow-2xl h-full overflow-y-auto custom-scrollbar">
+            <div className="p-6 border-b border-slate-800">
+                <h2 className="text-xl font-bold text-white mb-1">إنشاء مهمة جديدة (Production Control)</h2>
+                <p className="text-xs text-slate-500">تهيئة إعدادات الفيديو الجديد</p>
             </div>
-          </>
-        ) : (
-          <div className="flex-1 flex items-center justify-center text-slate-500 flex-col">
-            <Film size={48} className="mb-4 opacity-20" />
-            <p>اختر مهمة لعرض حالتها في السيرفر</p>
-          </div>
-        )}
-      </div>
+
+            <div className="p-6 space-y-5">
+                {/* Channel Selector */}
+                <div>
+                    <label className="text-xs text-slate-500 font-bold block mb-2 text-right">Channel</label>
+                    <select 
+                        value={channelId} 
+                        onChange={e => setChannelId(e.target.value)}
+                        className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-sm text-white focus:border-blue-500 outline-none text-right"
+                    >
+                        {channels.map(c => <option key={c.id} value={c.id}>{c.name} ({c.language})</option>)}
+                    </select>
+                </div>
+
+                {/* Production Type Toggles */}
+                <div>
+                    <label className="text-xs text-slate-500 font-bold block mb-2 text-right">Production Type</label>
+                    <div className="flex bg-slate-950 rounded-lg border border-slate-700 p-1">
+                        <button 
+                            onClick={() => setProdType('Shorts')}
+                            className={`flex-1 py-2 text-xs font-bold rounded flex items-center justify-center gap-2 transition ${prodType === 'Shorts' ? 'bg-purple-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}
+                        >
+                            Shorts (9:16) <Smartphone size={14} />
+                        </button>
+                        <button 
+                            onClick={() => setProdType('Long')}
+                            className={`flex-1 py-2 text-xs font-bold rounded flex items-center justify-center gap-2 transition ${prodType === 'Long' ? 'bg-blue-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}
+                        >
+                            Long Video <MonitorPlay size={14} />
+                        </button>
+                    </div>
+                </div>
+
+                {/* Topic Input */}
+                <div>
+                    <label className="text-xs text-slate-500 font-bold block mb-2 text-right">1. الموضوع (Topic)</label>
+                    <input 
+                        value={topic}
+                        onChange={e => setTopic(e.target.value)}
+                        placeholder="عن ماذا يتحدث الفيديو؟"
+                        className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-sm text-white focus:border-blue-500 outline-none text-right placeholder-slate-600"
+                    />
+                </div>
+
+                {/* Video Type & Model */}
+                <div className="space-y-4">
+                    <div>
+                        <label className="text-xs text-slate-500 font-bold block mb-2 text-right">Video Type</label>
+                        <select 
+                            value={videoType} onChange={e => setVideoType(e.target.value)}
+                            className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-sm text-white text-right outline-none"
+                        >
+                            <option>قصصي (Story)</option>
+                            <option>معلوماتي (Info)</option>
+                            <option>إخباري (News)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label className="text-xs text-slate-500 font-bold block mb-2 text-right">LLM Model</label>
+                        <select 
+                            value={llmModel} onChange={e => setLlmModel(e.target.value)}
+                            className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-sm text-white text-right outline-none"
+                        >
+                            <option>Gemini 2.0 Flash</option>
+                            <option>Gemini 3.0 Pro</option>
+                        </select>
+                    </div>
+                </div>
+
+                {/* Duration & Visual Mode Row */}
+                <div className="grid grid-cols-2 gap-4">
+                    <div>
+                        <label className="text-xs text-slate-500 font-bold block mb-2 text-center">Duration (min)</label>
+                        <div className="bg-slate-950 border border-slate-700 rounded-lg p-2 flex items-center justify-between">
+                            <Clock size={16} className="text-slate-500 ml-2" />
+                            <input 
+                                type="number" min="1" max="60"
+                                value={duration} onChange={e => setDuration(parseInt(e.target.value))}
+                                className="bg-transparent w-full text-center text-white outline-none font-mono"
+                            />
+                        </div>
+                    </div>
+                    <div>
+                        <label className="text-xs text-slate-500 font-bold block mb-2 text-center">Visual Mode</label>
+                        <div className="flex bg-slate-950 rounded-lg border border-slate-700 overflow-hidden h-[38px]">
+                            <button 
+                                onClick={() => setVisualMode('Veo')}
+                                className={`flex-1 text-xs font-bold transition ${visualMode === 'Veo' ? 'bg-purple-600 text-white' : 'text-slate-500 hover:text-slate-300'}`}
+                            >Veo</button>
+                            <div className="w-px bg-slate-700"></div>
+                            <button 
+                                onClick={() => setVisualMode('Images')}
+                                className={`flex-1 text-xs font-bold transition ${visualMode === 'Images' ? 'bg-slate-800 text-white' : 'text-slate-500 hover:text-slate-300'}`}
+                            >Images</button>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Music & Voice Row */}
+                <div className="grid grid-cols-2 gap-4">
+                    <div>
+                        <label className="text-xs text-slate-500 font-bold block mb-2 text-right">Music Director</label>
+                        <div className="flex bg-slate-950 rounded-lg border border-slate-700 overflow-hidden h-[38px]">
+                            <button onClick={() => setMusicMode('Off')} className={`flex-1 text-xs font-bold ${musicMode === 'Off' ? 'bg-slate-800 text-white' : 'text-slate-500'}`}>Off</button>
+                            <div className="w-px bg-slate-700"></div>
+                            <button onClick={() => setMusicMode('Auto Mix')} className={`flex-1 text-xs font-bold ${musicMode === 'Auto Mix' ? 'bg-green-600 text-white' : 'text-slate-500'}`}>Auto Mix</button>
+                        </div>
+                    </div>
+                    <div>
+                        <label className="text-xs text-slate-500 font-bold block mb-2 text-right">Voice Mode</label>
+                        <div className="flex bg-slate-950 rounded-lg border border-slate-700 overflow-hidden h-[38px]">
+                            <button onClick={() => setVoiceMode('تلقائي')} className={`flex-1 text-xs font-bold ${voiceMode === 'تلقائي' ? 'bg-slate-800 text-white' : 'text-slate-500'}`}>تلقائي</button>
+                            <div className="w-px bg-slate-700"></div>
+                            <button onClick={() => setVoiceMode('وكيل')} className={`flex-1 text-xs font-bold ${voiceMode === 'وكيل' ? 'bg-blue-600 text-white' : 'text-slate-500'}`}>وكيل</button>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Text Overlay Section */}
+                <div className="border-t border-slate-800 pt-4">
+                    <div className="flex justify-between items-center mb-3">
+                        <label className="text-xs text-slate-500 font-bold block text-right">إظهار النص (Text Overlay)</label>
+                        <div className="flex bg-slate-950 rounded border border-slate-700 h-7 w-32">
+                            <button onClick={() => setTextOverlay('إيقاف')} className={`flex-1 text-[10px] font-bold ${textOverlay === 'إيقاف' ? 'bg-slate-800 text-white' : 'text-slate-500'}`}>إيقاف</button>
+                            <button onClick={() => setTextOverlay('تشغيل')} className={`flex-1 text-[10px] font-bold ${textOverlay === 'تشغيل' ? 'bg-blue-600 text-white' : 'text-slate-500'}`}>تشغيل</button>
+                        </div>
+                    </div>
+                    
+                    {textOverlay === 'تشغيل' && (
+                        <div className="grid grid-cols-3 gap-2 animate-in fade-in slide-in-from-top-1">
+                            <div>
+                                <label className="text-[10px] text-slate-500 block mb-1 text-center">النمط</label>
+                                <select value={textStyle} onChange={e => setTextStyle(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded p-1.5 text-xs text-white text-center"><option>Cinematic</option><option>Bold</option><option>Minimal</option></select>
+                            </div>
+                            <div>
+                                <label className="text-[10px] text-slate-500 block mb-1 text-center">عدد السطور</label>
+                                <select value={textLines} onChange={e => setTextLines(parseInt(e.target.value))} className="w-full bg-slate-950 border border-slate-700 rounded p-1.5 text-xs text-white text-center"><option>1</option><option>2</option><option>3</option></select>
+                            </div>
+                            <div>
+                                <label className="text-[10px] text-slate-500 block mb-1 text-center">حجم النص</label>
+                                <select value={textSize} onChange={e => setTextSize(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded p-1.5 text-xs text-white text-center"><option>Small</option><option>Medium</option><option>Large</option></select>
+                            </div>
+                        </div>
+                    )}
+                </div>
+
+                {/* Actions */}
+                <div className="pt-6 mt-auto">
+                    <button 
+                        onClick={() => handleStartRun()}
+                        disabled={isRequesting}
+                        className="w-full bg-blue-700 hover:bg-blue-600 text-white py-4 rounded-xl font-bold text-sm flex items-center justify-center gap-3 transition shadow-lg shadow-blue-900/30 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                        {isRequesting ? <Loader2 className="animate-spin" /> : <Play fill="currentColor" />}
+                        Start Production Run ▷
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        {/* LEFT SIDE: Active Job Monitor (Timeline) */}
+        <div className="flex-1 bg-slate-950 relative flex flex-col">
+            {selectedJob ? (
+                <>
+                    {/* Header Info */}
+                    <div className="h-20 border-b border-slate-800 flex items-center justify-between px-8 bg-slate-900/20 backdrop-blur-sm z-10">
+                        <div className="flex items-center gap-4">
+                            <button className="bg-slate-800 border border-slate-700 text-slate-400 px-3 py-1.5 rounded text-xs font-bold hover:text-white transition">
+                                عرض السجلات
+                            </button>
+                        </div>
+                        <div className="flex items-center gap-4">
+                            <div className="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-full border border-blue-900/30">
+                                <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></span>
+                                <span className="text-xs text-blue-400 font-bold">Processing on Server</span>
+                            </div>
+                            <div className="flex items-center gap-2 text-slate-500 text-xs font-mono">
+                                <Clock size={14} />
+                                <span>{selectedJob.durationConfig?.target_value || 10} minutes</span>
+                            </div>
+                            <div className="text-slate-600 text-xs font-mono">
+                                ID: {selectedJob.id}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Content: Timeline Area */}
+                    <div className="flex-1 overflow-y-auto custom-scrollbar p-12">
+                        <div className="max-w-4xl mx-auto space-y-0 relative">
+                            
+                            {/* Vertical Line */}
+                            <div className="absolute top-4 bottom-10 right-[27px] w-0.5 bg-slate-800 z-0"></div>
+
+                            {/* Steps */}
+                            {selectedJob.steps.map((step, idx) => (
+                                <StepCard key={step.id} step={step} index={idx} job={selectedJob} />
+                            ))}
+                            
+                        </div>
+                    </div>
+                </>
+            ) : (
+                <div className="flex-1 flex flex-col items-center justify-center text-slate-600 opacity-30">
+                    <MonitorPlay size={80} className="mb-6" />
+                    <p className="text-2xl font-bold">System Idle</p>
+                    <p className="text-sm">Waiting for production run...</p>
+                </div>
+            )}
+        </div>
+
     </div>
   );
 };
