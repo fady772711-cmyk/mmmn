@@ -73,10 +73,19 @@ app.get('/api/health', (req, res) => {
     });
 });
 
-// 3. Artifacts Serving (Range Support for Video)
+// 3. Artifacts Serving (Range Support for Video/Audio)
 app.get('/api/artifacts/:filename', (req, res) => {
     const filePath = path.join(__dirname, 'storage', req.params.filename);
     if (!fs.existsSync(filePath)) return res.status(404).send('File not found');
+
+    // Determine Content-Type
+    const ext = path.extname(req.params.filename).toLowerCase();
+    let contentType = 'application/octet-stream';
+    if (ext === '.mp4') contentType = 'video/mp4';
+    if (ext === '.wav') contentType = 'audio/wav';
+    if (ext === '.mp3') contentType = 'audio/mpeg';
+    if (ext === '.png') contentType = 'image/png';
+    if (ext === '.jpg' || ext === '.jpeg') contentType = 'image/jpeg';
 
     const stat = fs.statSync(filePath);
     const fileSize = stat.size;
@@ -92,14 +101,14 @@ app.get('/api/artifacts/:filename', (req, res) => {
             'Content-Range': `bytes ${start}-${end}/${fileSize}`,
             'Accept-Ranges': 'bytes',
             'Content-Length': chunksize,
-            'Content-Type': 'video/mp4',
+            'Content-Type': contentType,
         };
         res.writeHead(206, head);
         file.pipe(res);
     } else {
         const head = {
             'Content-Length': fileSize,
-            'Content-Type': 'video/mp4',
+            'Content-Type': contentType,
         };
         res.writeHead(200, head);
         fs.createReadStream(filePath).pipe(res);

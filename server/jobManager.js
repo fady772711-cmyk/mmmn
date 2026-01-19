@@ -84,8 +84,9 @@ class JobManager {
                 { id: 's2', agentRole: 'TitleGenerator', name: 'Viral Titles', status: 'PENDING' },
                 { id: 's3', agentRole: 'ScriptBuilder', name: 'Professional Script', status: 'PENDING' },
                 { id: 's4', agentRole: 'VisualProducer', name: 'Visual Prompts', status: 'PENDING' },
-                { id: 's5', agentRole: 'DescriptionAgent', name: 'SEO Description', status: 'PENDING' },
-                { id: 's6', agentRole: 'EditorAssembler', name: 'Final Assembly', status: 'PENDING' } // Added Final Assembly
+                { id: 's5', agentRole: 'VoiceDirector', name: 'AI Voiceover', status: 'PENDING' }, // Added Voice
+                { id: 's6', agentRole: 'DescriptionAgent', name: 'SEO Description', status: 'PENDING' },
+                { id: 's7', agentRole: 'EditorAssembler', name: 'Final Assembly', status: 'PENDING' } 
             ];
         }
 
@@ -210,6 +211,11 @@ class JobManager {
             step.outputSummary = "Mock Script Generated";
             step.artifacts = [{ label: 'Full Script', type: 'text', content: job.artifacts.script }];
         }
+        else if (step.agentRole === 'VoiceDirector') {
+            // Mock Voice
+            step.outputSummary = "Mock Audio Generated";
+            step.artifacts = [{ label: 'Audio', type: 'audio', url: '#' }];
+        }
         else if (step.agentRole === 'VisualProducer') {
             const prompts = ["Ancient coffee house in Mecca, 1511", "Angry Sultan forbidding coffee", "Modern latte art close up"];
             const mockImages = prompts.map((p, i) => ({
@@ -229,7 +235,6 @@ class JobManager {
         }
         else if (step.agentRole === 'EditorAssembler') {
             // Mock Video Assembly
-            // Use a reliable sample video URL for demonstration
             const sampleVideo = "https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4";
             job.artifacts.finalVideoUrl = sampleVideo;
             step.outputSummary = "Final Video Assembled (Simulation)";
@@ -306,6 +311,61 @@ class JobManager {
                 job.artifacts.script = resultText;
                 step.outputSummary = "Full Script Generated";
                 step.artifacts = [{ label: 'Full Script', type: 'text', content: resultText }];
+            }
+            else if (step.agentRole === 'VoiceDirector') {
+                const scriptText = job.artifacts.script || "No script provided";
+                // Only generate audio for the first 2 minutes max to save tokens/time in this demo server
+                const textChunk = scriptText.substring(0, 3000); 
+                
+                console.log(`[JobManager] Generating TTS for VoiceDirector...`);
+                // Use generateContent for TTS model
+                const response = await ai.models.generateContent({
+                    model: 'gemini-2.5-flash-preview-tts',
+                    contents: { parts: [{ text: textChunk }] },
+                    config: {
+                        responseModalities: ['AUDIO'], // Use string here as it's commonJS/Server
+                        speechConfig: {
+                            voiceConfig: {
+                                prebuiltVoiceConfig: { voiceName: 'Kore' }
+                            }
+                        }
+                    }
+                });
+                
+                const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+                if (base64Audio) {
+                    const buffer = Buffer.from(base64Audio, 'base64');
+                    // Simple WAV Header construction for 24kHz mono (Gemini default)
+                    const filename = `${job.id}_voice.wav`;
+                    const filePath = path.join(STORAGE_DIR, filename);
+                    
+                    const wavHeader = Buffer.alloc(44);
+                    const dataLen = buffer.length;
+                    const sampleRate = 24000;
+                    
+                    wavHeader.write('RIFF', 0);
+                    wavHeader.writeUInt32LE(36 + dataLen, 4);
+                    wavHeader.write('WAVE', 8);
+                    wavHeader.write('fmt ', 12);
+                    wavHeader.writeUInt32LE(16, 16);
+                    wavHeader.writeUInt16LE(1, 20); // PCM
+                    wavHeader.writeUInt16LE(1, 22); // Mono
+                    wavHeader.writeUInt32LE(sampleRate, 24);
+                    wavHeader.writeUInt32LE(sampleRate * 2, 28); // Byte Rate
+                    wavHeader.writeUInt16LE(2, 32); // Block Align
+                    wavHeader.writeUInt16LE(16, 34); // Bits per sample
+                    wavHeader.write('data', 36);
+                    wavHeader.writeUInt32LE(dataLen, 40);
+                    
+                    const finalBuffer = Buffer.concat([wavHeader, buffer]);
+                    fs.writeFileSync(filePath, finalBuffer);
+                    
+                    job.artifacts.audioUrl = `/api/artifacts/${filename}`;
+                    step.outputSummary = "Voice Audio Generated & Saved";
+                    step.artifacts = [{ label: 'Voiceover', type: 'audio', url: job.artifacts.audioUrl }];
+                } else {
+                    throw new Error("No audio data received from Gemini TTS");
+                }
             }
             else if (step.agentRole === 'DescriptionAgent') { 
                 const prompt = `
