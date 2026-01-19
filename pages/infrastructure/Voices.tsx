@@ -6,13 +6,33 @@ import { generateSpeech } from '../../services/geminiService';
 import { Play, Mic, Plus, Trash2, Loader2, Save } from 'lucide-react';
 import InlineCopilot from '../../components/InlineCopilot';
 
-const ALLOWED_VOICES = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'];
+// Google Gemini Standard Voices
+const GOOGLE_VOICES = [
+  'achernar', 'achird', 'algenib', 'algieba', 'alnilam', 'aoede', 'autonoe', 'callirrhoe', 
+  'charon', 'despina', 'enceladus', 'erinome', 'fenrir', 'gacrux', 'iapetus', 'kore', 
+  'laomedeia', 'leda', 'orus', 'puck', 'pulcherrima', 'rasalgethi', 'sadachbia', 
+  'sadaltager', 'schedar', 'sulafat', 'umbriel', 'vindemiatrix', 'zephyr', 'zubenelgenubi'
+];
+
+// GeminiGen Known Voices
+const GEMINIGEN_PRESETS = [
+    { id: 'GM001', name: 'GM001 - Standard Male' },
+    { id: 'GM002', name: 'GM002 - Standard Female' },
+    { id: 'GM003', name: 'GM003 - Soft Male' },
+    { id: 'GM004', name: 'GM004 - Soft Female' },
+    { id: 'GM005', name: 'GM005 - Strong Male' },
+    { id: 'GM013', name: 'GM013 - Gacrux (Deep)' },
+    { id: 'GM014', name: 'GM014 - Kore (Clean)' },
+    { id: 'GM015', name: 'GM015 - Charon (Story)' },
+    { id: 'GM016', name: 'GM016 - Fenrir (Deep)' },
+    { id: 'GM017', name: 'GM017 - Puck (News)' }
+];
 
 const Voices: React.FC = () => {
   const [voices, setVoices] = useState<VoicePreset[]>([]);
   const [loading, setLoading] = useState(true);
   const [testingVoiceId, setTestingVoiceId] = useState<string | null>(null);
-  const [testText, setTestText] = useState("مرحباً، هذا اختبار للصوت العربي من Gemini.");
+  const [testText, setTestText] = useState("مرحباً، هذا اختبار للصوت العربي.");
 
   useEffect(() => {
     loadData();
@@ -20,7 +40,7 @@ const Voices: React.FC = () => {
 
   const loadData = async () => {
     setLoading(true);
-    const data = await db.getVoices();
+    let data = await db.getVoices();
     setVoices(data);
     setLoading(false);
   };
@@ -29,8 +49,8 @@ const Voices: React.FC = () => {
     const newVoice: VoicePreset = {
         id: `voice_${Date.now()}`,
         name: 'New Voice Config',
-        providerId: 'prov_1', // Gemini
-        nativeVoiceId: 'Kore',
+        providerId: 'prov_1', // Default to Gemini
+        nativeVoiceId: 'kore',
         gender: 'Male',
         style: 'Neutral',
         languageCode: 'ar-SA'
@@ -58,8 +78,8 @@ const Voices: React.FC = () => {
         const url = URL.createObjectURL(blob);
         const audio = new Audio(url);
         audio.play();
-    } catch (e) {
-        alert("فشل توليد الصوت: تأكد من مفتاح API في المزودات");
+    } catch (e: any) {
+        alert("فشل توليد الصوت: " + e.message);
         console.error(e);
     } finally {
         setTestingVoiceId(null);
@@ -72,9 +92,9 @@ const Voices: React.FC = () => {
           // Payload: { name, nativeVoiceId, gender, style, languageCode }
           const newVoice: VoicePreset = {
               id: `voice_ai_${Date.now()}`,
-              providerId: 'prov_1', // Force Gemini for now
+              providerId: payload.providerId || 'prov_1', 
               name: payload.name || "AI Generated Voice",
-              nativeVoiceId: payload.nativeVoiceId || "Kore",
+              nativeVoiceId: payload.nativeVoiceId || "kore",
               gender: payload.gender || "Male",
               style: payload.style || "Standard",
               languageCode: payload.languageCode || "ar-SA"
@@ -87,22 +107,22 @@ const Voices: React.FC = () => {
   const VOICE_ARCHITECT_PROMPT = `You are a Voice Engineer/Architect Agent.
   Your goal is to create Voice Presets based on user description.
   
-  Available Base Models (Gemini TTS): ['Puck' (Male, Energetic), 'Charon' (Male, Deep/Scary), 'Kore' (Female, Neutral/News), 'Fenrir' (Male, Authoritative), 'Zephyr' (Female, Calm)].
+  Available Base Models (Gemini TTS): ['puck', 'charon', 'kore', 'fenrir', 'zephyr', 'aoede', 'eneladus', 'iapetus'].
   
   User Request: "Make an Egyptian News Anchor voice".
-  Logic: Map "Egyptian" to 'ar-EG', "News Anchor" to 'Kore' or 'Fenrir', style "Professional".
+  Logic: Map "Egyptian" to 'ar-EG', "News Anchor" to 'kore' or 'fenrir', style "Professional".
   
   Action: 'create_voice_preset'
   Payload: {
     "name": "Egyptian News Anchor",
-    "nativeVoiceId": "Kore",
+    "nativeVoiceId": "kore",
     "gender": "Female",
     "style": "News/Professional",
     "languageCode": "ar-EG"
   }
   
   User Request: "Scary storyteller for horror channel".
-  Payload: { "name": "Horror Narrator", "nativeVoiceId": "Charon", "style": "Terrifying", "languageCode": "ar-SA" }`;
+  Payload: { "name": "Horror Narrator", "nativeVoiceId": "charon", "style": "Terrifying", "languageCode": "ar-SA" }`;
 
   return (
     <div className="flex h-[calc(100vh-140px)] gap-6">
@@ -133,7 +153,7 @@ const Voices: React.FC = () => {
                 <div key={voice.id} className="bg-slate-900 border border-slate-800 rounded-xl p-6 hover:border-slate-700 transition relative group">
                     <div className="flex justify-between items-start mb-4">
                         <div className="flex items-center gap-3">
-                            <div className={`w-10 h-10 rounded-full flex items-center justify-center ${voice.id.includes('ai') ? 'bg-purple-500/10 text-purple-500' : 'bg-indigo-500/10 text-indigo-500'}`}>
+                            <div className={`w-10 h-10 rounded-full flex items-center justify-center ${voice.providerId === 'prov_geminigen' ? 'bg-amber-500/10 text-amber-500' : 'bg-indigo-500/10 text-indigo-500'}`}>
                                 <Mic size={20} />
                             </div>
                             <div>
@@ -150,17 +170,61 @@ const Voices: React.FC = () => {
                         </button>
                     </div>
 
-                    <div className="bg-slate-950 p-3 rounded-lg mb-4 space-y-2">
+                    <div className="bg-slate-950 p-3 rounded-lg mb-4 space-y-3">
                         <div className="flex justify-between items-center text-xs">
-                            <span className="text-slate-500">Voice ID</span>
+                            <span className="text-slate-500">Provider</span>
                             <select 
-                                value={voice.nativeVoiceId}
-                                onChange={(e) => updateVoice(voice.id, { nativeVoiceId: e.target.value })}
+                                value={voice.providerId}
+                                onChange={(e) => updateVoice(voice.id, { providerId: e.target.value })}
                                 className="bg-slate-900 border border-slate-700 rounded text-slate-300 text-xs p-1"
                             >
-                                {ALLOWED_VOICES.map(v => <option key={v} value={v}>{v}</option>)}
+                                <option value="prov_1">Google Gemini</option>
+                                <option value="prov_geminigen">GeminiGen.AI</option>
+                                <option value="prov_3">ElevenLabs</option>
                             </select>
                         </div>
+                        <div className="flex justify-between items-center text-xs">
+                            <span className="text-slate-500">Voice ID</span>
+                            {/* Logic to show appropriate dropdown or input based on provider */}
+                            {voice.providerId === 'prov_1' ? (
+                                <select 
+                                    value={voice.nativeVoiceId}
+                                    onChange={(e) => updateVoice(voice.id, { nativeVoiceId: e.target.value })}
+                                    className="bg-slate-900 border border-slate-700 rounded text-slate-300 text-xs p-1 w-32"
+                                >
+                                    {GOOGLE_VOICES.map(v => <option key={v} value={v}>{v}</option>)}
+                                </select>
+                            ) : voice.providerId === 'prov_geminigen' ? (
+                                <select 
+                                    value={voice.nativeVoiceId}
+                                    onChange={(e) => updateVoice(voice.id, { nativeVoiceId: e.target.value })}
+                                    className="bg-slate-900 border border-slate-700 rounded text-slate-300 text-xs p-1 w-32"
+                                >
+                                    <option value="">Select ID...</option>
+                                    {GEMINIGEN_PRESETS.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                                    <option value="custom">Custom ID</option>
+                                </select>
+                            ) : (
+                                <input 
+                                    value={voice.nativeVoiceId}
+                                    onChange={(e) => updateVoice(voice.id, { nativeVoiceId: e.target.value })}
+                                    placeholder="e.g. GM013"
+                                    className="bg-slate-900 border border-slate-700 rounded text-slate-300 text-xs p-1 w-32"
+                                />
+                            )}
+                        </div>
+                        {/* Custom Input fallback for GeminiGen */}
+                        {voice.providerId === 'prov_geminigen' && !GEMINIGEN_PRESETS.find(p => p.id === voice.nativeVoiceId) && (
+                             <div className="flex justify-between items-center text-xs animate-in fade-in">
+                                <span className="text-slate-500">Custom ID</span>
+                                <input 
+                                    value={voice.nativeVoiceId}
+                                    onChange={(e) => updateVoice(voice.id, { nativeVoiceId: e.target.value })}
+                                    placeholder="e.g. GM099"
+                                    className="bg-slate-900 border border-slate-700 rounded text-slate-300 text-xs p-1 w-32"
+                                />
+                             </div>
+                        )}
                     </div>
 
                     <button 

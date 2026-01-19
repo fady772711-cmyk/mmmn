@@ -1,7 +1,8 @@
 
-
 import { GoogleGenAI, Type, Modality, Schema } from "@google/genai";
 import { Channel, StrategyResult, StructureResult, ScriptResult, PacingResult, TitleResult, Chapter, TitleSelectionResult, ScenePlanResult, TitleVariant, AgentResult, DurationConfig, AdminPlannerResult, ProductionLine, MusicTrack, MusicDirectorResult, AnalystResult } from "../types";
+import { generateGeminiGenSpeech } from './geminiGenService';
+import { db } from './storageService';
 
 // Helper to safely get API key (Prioritize passed key, then env)
 const getApiKey = (overriddenKey?: string): string => {
@@ -12,32 +13,49 @@ const getApiKey = (overriddenKey?: string): string => {
   return key;
 };
 
+// --- Helper: Error Analysis ---
+const isQuotaError = (e: any) => {
+  const msg = e.message?.toLowerCase() || '';
+  return e.status === 429 || 
+         e.status === 503 || 
+         msg.includes('429') || 
+         msg.includes('quota') || 
+         msg.includes('resource_exhausted') ||
+         msg.includes('too many requests') ||
+         msg.includes('limit: 0');
+};
+
+const isVoiceError = (e: any) => {
+    const msg = e.message?.toLowerCase() || '';
+    return msg.includes('voice name') && msg.includes('not supported');
+};
+
 // --- Helper: Retry Logic ---
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-async function withRetry<T>(fn: () => Promise<T>, retries = 3, baseDelay = 5000): Promise<T> {
+async function withRetry<T>(fn: () => Promise<T>, retries = 3, baseDelay = 2000): Promise<T> {
   try {
     return await fn();
   } catch (e: any) {
-    // Check for Rate Limit (429) or Service Unavailable (503)
-    if (retries > 0 && (e.status === 429 || e.status === 503 || e.message?.includes('429') || e.message?.includes('quota'))) {
+    // Immediate retry logic is handled inside generateStructuredContent for models, 
+    // but this generic retry handles network blips or generic 429s if not handled deeper.
+    if (retries > 0 && isQuotaError(e)) {
        let wait = baseDelay;
-       // Try to parse "retry in X seconds" from error message
        const match = e.message?.match(/retry in (\d+(\.\d+)?)s/);
        if (match) {
-           wait = Math.ceil(parseFloat(match[1]) * 1000) + 2000; // Add 2s buffer
+           wait = Math.ceil(parseFloat(match[1]) * 1000) + 1000;
        } else {
-           wait = baseDelay * (4 - retries); // 5000, 10000, 15000
+           wait = baseDelay * (4 - retries); // Exponential backoff
        }
        console.warn(`[Gemini Service] Rate limit hit. Waiting ${wait}ms before retry... (${retries} retries left)`);
        await sleep(wait);
-       return withRetry(fn, retries - 1, baseDelay);
+       return withRetry(fn, retries - 1, baseDelay * 1.5);
     }
     
-    // Retry on JSON Parse Errors (often transient model glitches)
+    // Retry on JSON Parse Errors
     if (retries > 0 && (e.message?.includes("JSON Parse Failed") || e.message?.includes("Unexpected end of JSON"))) {
         console.warn(`[Gemini Service] JSON Parse Error. Retrying... (${retries} retries left)`);
-        await sleep(2000);
+        await sleep(1000);
         return withRetry(fn, retries - 1, baseDelay);
     }
 
@@ -68,22 +86,17 @@ function cleanAndParseJson(text: string): any {
         if (endIdx !== -1) {
             clean = clean.substring(startIdx, endIdx + 1);
         } else {
-            // Truncated? Start from the first brace but keep the rest
             clean = clean.substring(startIdx);
         }
     }
 
     // 3. Fix Common GenAI JSON Errors
-    // Remove trailing commas
-    clean = clean.replace(/,(\s*[}\]])/g, '$1');
+    clean = clean.replace(/,(\s*[}\]])/g, '$1'); // Remove trailing commas
     
-    // Attempt Parse
     try {
         return JSON.parse(clean);
     } catch (e: any) {
         // Fallback Strategy for Repairing Broken JSON
-        
-        // Strategy A: Fix unescaped newlines in strings (Common in Arabic output)
         if (e.message && (e.message.includes("Unterminated string") || e.message.includes("Unexpected token"))) {
              try {
                  const oneLine = clean.replace(/[\n\r]/g, " ");
@@ -91,39 +104,11 @@ function cleanAndParseJson(text: string): any {
              } catch (e2) {}
         }
 
-        // Strategy B: Append common closure patterns
-        // This helps if the model stopped right at the end
+        // Try appending closures
         if (e.message && (e.message.includes("end of JSON input") || e.message.includes("Unterminated string"))) {
-            const possibleClosures = [
-                '" }',       // Close string then object
-                '"] }',      // Close string then array then object
-                '"]',        // Close string then array
-                '}',         // Close object
-                ']',         // Close array
-                '] }',       // Close array then object
-                ' }',        // Just space and object
-                '"}]}',      // Close string -> Object end -> Array end -> Root Object end
-                '}]}'        // Object end -> Array end -> Root Object end
-            ];
-
+            const possibleClosures = ['" }', '"] }', '"]', '}', ']', '] }', ' }', '"}]}'];
             for (const closure of possibleClosures) {
-                try {
-                    return JSON.parse(clean + closure);
-                } catch (e3) {}
-            }
-            
-            // Strategy C: Aggressive Truncation (Backtrack to last valid object in an array)
-            // Use case: The list of scenes was cut off in the middle of scene #10.
-            // Action: Discard the incomplete scene #10 and close the array after scene #9.
-            // Look for the last occurrence of "}," which signifies the end of a previous object in a list.
-            const lastObjectEnd = clean.lastIndexOf("},");
-            if (lastObjectEnd !== -1) {
-                 const truncated = clean.substring(0, lastObjectEnd + 1); // Keep the "}," but regex below removes comma
-                 const truncatedClean = truncated.replace(/,$/, ""); // Remove the trailing comma
-                 const closures = [']}', ']']; // Try closing array + root, or just array
-                 for (const closure of closures) {
-                    try { return JSON.parse(truncatedClean + closure); } catch (e4) {}
-                 }
+                try { return JSON.parse(clean + closure); } catch (e3) {}
             }
         }
         
@@ -131,7 +116,7 @@ function cleanAndParseJson(text: string): any {
     }
 }
 
-// --- Core Helper: Structured Generation with Usage Tracking ---
+// --- Core Helper: Structured Generation with Usage Tracking & Model Fallback ---
 interface GenerationConfig {
   temperature: number;
   systemInstruction: string;
@@ -142,52 +127,77 @@ interface GenerationConfig {
 const generateStructuredContent = async <T>(
   prompt: string,
   config: GenerationConfig,
-  modelName: string = "gemini-3-flash-preview", // Default baseline
+  preferredModel: string = "gemini-3-flash-preview",
   apiKeyOverride?: string
 ): Promise<{ data: T; usage: { prompt: number; candidates: number; total: number } }> => {
   const apiKey = getApiKey(apiKeyOverride);
   const ai = new GoogleGenAI({ apiKey });
 
-  return withRetry(async () => {
-    try {
-        const response = await ai.models.generateContent({
-        model: modelName,
-        contents: prompt,
-        config: {
-            // Explicitly forbid trailing commas and newlines in strings
-            systemInstruction: config.systemInstruction + " IMPORTANT: Output strictly valid JSON. Do not include markdown formatting. NO trailing commas. NO newlines inside strings. Escape all double quotes within strings.",
-            temperature: config.temperature, 
-            responseMimeType: "application/json", 
-            responseSchema: config.schema,
-            // Optimization: Adjusted limits. 
-            maxOutputTokens: config.maxTokens || 4000, 
-        }
-        });
+  // Fallback Chain Definition
+  const modelsToTry = [preferredModel];
+  
+  // If requesting a Pro/v3 model, add fallbacks to Flash/v2
+  if (preferredModel.includes('gemini-3')) {
+      if (!modelsToTry.includes('gemini-3-flash-preview')) modelsToTry.push('gemini-3-flash-preview');
+      if (!modelsToTry.includes('gemini-2.5-flash')) modelsToTry.push('gemini-2.5-flash');
+  } else if (preferredModel === 'gemini-2.5-flash') {
+      modelsToTry.push('gemini-flash-latest');
+  }
 
-        const usage = {
-        prompt: response.usageMetadata?.promptTokenCount || 0,
-        candidates: response.usageMetadata?.candidatesTokenCount || 0,
-        total: response.usageMetadata?.totalTokenCount || 0
-        };
+  let lastError: any;
 
-        const text = response.text || "{}";
-        const data = cleanAndParseJson(text);
-        
-        return { data, usage };
-    } catch (e: any) {
-        console.error("Agent Execution Error:", e);
-        
-        if (e.message?.includes("401") || e.status === 401) {
-             throw new Error("Authentication Failed (401). Please check your API Key in the 'Providers' tab.");
-        }
-        
-        if (e.message?.includes("404") || e.status === 404) {
-            throw new Error(`Model '${modelName}' not found. Check if your API Key has access to this model.`);
-        }
+  for (const model of modelsToTry) {
+      try {
+          // Wrapped in a single-try logic because the loop handles the "retry with different model" aspect.
+          // We can still use withRetry for network glitches on the *same* model if we wanted, 
+          // but here we prioritize switching models on quota errors.
+          console.log(`[Gemini] Requesting with model: ${model}`);
+          
+          const response = await ai.models.generateContent({
+              model: model,
+              contents: prompt,
+              config: {
+                  systemInstruction: config.systemInstruction + " IMPORTANT: Output strictly valid JSON. Do not include markdown formatting. NO trailing commas. NO newlines inside strings.",
+                  temperature: config.temperature, 
+                  responseMimeType: "application/json", 
+                  responseSchema: config.schema,
+                  maxOutputTokens: config.maxTokens || 4000, 
+              }
+          });
 
-        throw e; 
-    }
-  });
+          const usage = {
+              prompt: response.usageMetadata?.promptTokenCount || 0,
+              candidates: response.usageMetadata?.candidatesTokenCount || 0,
+              total: response.usageMetadata?.totalTokenCount || 0
+          };
+
+          const text = response.text || "{}";
+          const data = cleanAndParseJson(text);
+          
+          return { data, usage };
+
+      } catch (e: any) {
+          lastError = e;
+          if (isQuotaError(e)) {
+              console.warn(`[Gemini] Model ${model} failed with quota/rate limit. Falling back to next model...`);
+              continue; // Try next model in chain
+          }
+          // If it's not a quota error (e.g. invalid key, bad request), fail fast or let withRetry handle it if we wrapped it
+          throw e;
+      }
+  }
+
+  // If all models failed
+  console.error("All models failed. Last error:", lastError);
+  if (isQuotaError(lastError)) {
+      throw new Error(`Quota exceeded for all attempted models. Please check your billing or API key.`);
+  }
+  
+  if (lastError.message?.includes("401") || lastError.status === 401) {
+        throw new Error("Authentication Failed (401). Please check your API Key.");
+  }
+  
+  throw lastError;
 };
 
 // --- Helper: PCM to WAV Converter ---
@@ -199,12 +209,9 @@ function pcmToWav(pcmData: Uint8Array, sampleRate: number = 24000): Blob {
   const buffer = new ArrayBuffer(44 + dataSize);
   const view = new DataView(buffer);
 
-  // RIFF chunk
   writeString(view, 0, 'RIFF');
   view.setUint32(4, 36 + dataSize, true);
   writeString(view, 8, 'WAVE');
-
-  // fmt chunk
   writeString(view, 12, 'fmt ');
   view.setUint32(16, 16, true);
   view.setUint16(20, 1, true);
@@ -213,8 +220,6 @@ function pcmToWav(pcmData: Uint8Array, sampleRate: number = 24000): Blob {
   view.setUint32(28, byteRate, true);
   view.setUint16(32, blockAlign, true);
   view.setUint16(34, 16, true);
-
-  // data chunk
   writeString(view, 36, 'data');
   view.setUint32(40, dataSize, true);
   
@@ -234,12 +239,12 @@ function writeString(view: DataView, offset: number, string: string) {
 
 export const runAnalystAgent = async (
     channel: Channel,
-    analyticsData: any, // Views, trends, last video performance
+    analyticsData: any,
     count: number,
     apiKey?: string
 ): Promise<{ data: AnalystResult; usage: any }> => {
     
-    // UPGRADE: Using 'gemini-3-pro-preview' for advanced reasoning and data analysis
+    // Fallback order: Pro -> Flash -> 2.5 Flash
     const model = 'gemini-3-pro-preview';
 
     const systemInstruction = `أنت AnalystAgent، محلل بيانات خبير لقنوات اليوتيوب.
@@ -321,45 +326,13 @@ export const runMusicDirectorAgent = async (
 ): Promise<{ data: MusicDirectorResult; usage: any }> => {
 
     const systemInstruction = `أنت MusicDirector داخل مصنع فيديوهات احترافي.
-
-مهمتك:
-اختيار موسيقى خلفية مناسبة من مكتبة YouTube Audio Library فقط.
-
-المدخلات:
-- video_type: {long_narrative | long_explainer | shorts}
-- tone: {cinematic | documentary | mysterious | calm | motivational}
-- voice_profile: {calm | neutral | intense}
-- duration_seconds
-- script_summary
-- library_tracks (من YouTube Audio Library فقط)
-
+مهمتك: اختيار موسيقى خلفية مناسبة من مكتبة YouTube Audio Library فقط.
 قواعد صارمة:
 - اختر tracks بدون غناء فقط (has_vocals=false).
 - الموسيقى خلفية لا تنافس الصوت.
-- لا تختار أكثر من 2 tracks.
 - إذا لا يوجد تراك مناسب: decision="no_track".
-- لا تُنشئ موسيقى جديدة.
-- لا تستخدم أي مكتبة أخرى.
+- أخرج JSON فقط.`;
 
-أخرج JSON فقط بالشكل التالي:
-{
-  "decision": "select_track" | "no_track",
-  "selected": [
-    {
-      "track_id": "...",
-      "usage": "intro" | "main",
-      "loop": true
-    }
-  ],
-  "mixing": {
-    "music_volume_db": -18,
-    "ducking_db": -12,
-    "fade_in_sec": 2,
-    "fade_out_sec": 3
-  }
-}`;
-
-    // Only pass relevant track info to save context window
     const simplifiedTracks = context.library_tracks.map(t => ({
         id: t.id,
         title: t.title,
@@ -372,33 +345,15 @@ export const runMusicDirectorAgent = async (
     const prompt = `
 المدخلات:
 - video_type: ${context.video_type}
-- language: ${context.language}
 - tone: ${context.tone}
-- voice_profile: ${context.voice_profile}
-- duration_seconds: ${context.duration_seconds}
 - script_summary: "${context.script_summary}"
 - library_tracks: ${JSON.stringify(simplifiedTracks)}
 
-المطلوب:
 صيغة الإخراج (JSON):
 {
   "decision": "select_track" | "no_track",
-  "selected": [
-    {
-      "track_id": "…",
-      "usage": "intro" | "main",
-      "start_sec": 0,
-      "end_sec": null,
-      "loop": true
-    }
-  ],
-  "mixing": {
-    "music_volume_db": -18,
-    "ducking_db": -12,
-    "fade_in_sec": 2.5,
-    "fade_out_sec": 3.0,
-    "sidechain": true
-  },
+  "selected": [{ "track_id": "…", "usage": "main", "start_sec": 0, "end_sec": null, "loop": true }],
+  "mixing": { "music_volume_db": -18, "ducking_db": -12, "fade_in_sec": 2.5, "fade_out_sec": 3.0, "sidechain": true },
   "notes": "سبب الاختيار باختصار"
 }`;
 
@@ -406,29 +361,8 @@ export const runMusicDirectorAgent = async (
         type: Type.OBJECT,
         properties: {
             decision: { type: Type.STRING, enum: ["select_track", "no_track"] },
-            selected: {
-                type: Type.ARRAY,
-                items: {
-                    type: Type.OBJECT,
-                    properties: {
-                        track_id: { type: Type.STRING },
-                        usage: { type: Type.STRING, enum: ["intro", "main"] },
-                        start_sec: { type: Type.NUMBER },
-                        end_sec: { type: Type.NUMBER },
-                        loop: { type: Type.BOOLEAN }
-                    }
-                }
-            },
-            mixing: {
-                type: Type.OBJECT,
-                properties: {
-                    music_volume_db: { type: Type.NUMBER },
-                    ducking_db: { type: Type.NUMBER },
-                    fade_in_sec: { type: Type.NUMBER },
-                    fade_out_sec: { type: Type.NUMBER },
-                    sidechain: { type: Type.BOOLEAN }
-                }
-            },
+            selected: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { track_id: { type: Type.STRING }, usage: { type: Type.STRING }, start_sec: { type: Type.NUMBER }, end_sec: { type: Type.NUMBER }, loop: { type: Type.BOOLEAN } } } },
+            mixing: { type: Type.OBJECT, properties: { music_volume_db: { type: Type.NUMBER }, ducking_db: { type: Type.NUMBER }, fade_in_sec: { type: Type.NUMBER }, fade_out_sec: { type: Type.NUMBER }, sidechain: { type: Type.BOOLEAN } } },
             notes: { type: Type.STRING }
         },
         required: ["decision", "selected", "mixing", "notes"]
@@ -437,7 +371,7 @@ export const runMusicDirectorAgent = async (
     return generateStructuredContent<MusicDirectorResult>(prompt, { temperature: 0.5, systemInstruction, schema, maxTokens: 2000 }, "gemini-3-flash-preview", apiKey);
 };
 
-// --- 0. Admin Planner Agent (Management: 0.8) ---
+// --- 0. Admin Planner Agent ---
 
 export const runAdminPlannerAgent = async (
     channel: Channel,
@@ -447,42 +381,17 @@ export const runAdminPlannerAgent = async (
     apiKey?: string
 ): Promise<{ data: AdminPlannerResult; usage: any }> => {
     
-    // Construct strict System Instruction as per user request
     const systemInstruction = `أنت AdminPlanner داخل نظام أتمتة قناة يوتيوب.
-
-مهمتك:
-إنشاء خطة نشر يومية (Automation Plan) للقناة بدون إنتاج سكربت أو فيديو.
-
-المطلوب:
-- اقترح ${times.length} عناصر (items) مطابق لعدد الأوقات.
-- لكل عنصر:
-  - time
-  - topic
-  - title (قوي ومناسب للقناة)
-  - angle (جملة واحدة)
-  - duration (sec للشورت أو minutes للطويل)
-  - visual provider (حسب خط الإنتاج)
-- اجعل العناوين متنوعة وغير مكررة.
+مهمتك: إنشاء خطة نشر يومية.
+- اقترح ${times.length} عناصر.
 - لا تكتب سكربت.
-- لا تذكر معلومات غير مؤكدة كحقائق.
-- أخرج JSON فقط بدون أي نص إضافي.`;
-
-    const channelProfile = {
-        name: channel.name,
-        language: channel.language,
-        niche: channel.niche || 'General Interest',
-        tone: channel.tone,
-        audience: channel.audienceDescription || 'General Audience'
-    };
+- أخرج JSON فقط.`;
 
     const prompt = `
 المدخلات:
-- channel_profile: ${JSON.stringify(channelProfile)}
 - production_line: ${pipelineType}
 - videos_per_day: ${times.length}
 - times: ${JSON.stringify(times)}
-- timezone: "Asia/Riyadh" (Default)
-- constraints: ${pipelineType === 'Shorts' ? '{duration: 40-60 sec}' : '{duration: 8-15 min}'}
 - date: ${dateStr}
 
 صيغة الإخراج المطلوبة (JSON Strict):
@@ -527,12 +436,11 @@ export const runAdminPlannerAgent = async (
         required: ["date", "timezone", "target_channel_id", "items"]
     };
 
-    // Use Flash for speed in admin tasks
     return generateStructuredContent<AdminPlannerResult>(prompt, { temperature: 0.8, systemInstruction, schema, maxTokens: 4000 }, "gemini-3-flash-preview", apiKey);
 };
 
 
-// --- 1. Strategy Agent (Creative: 0.7) ---
+// --- 1. Strategy Agent ---
 
 export const runStrategyAgent = async (
   channel: Channel,
@@ -541,34 +449,16 @@ export const runStrategyAgent = async (
   apiKey?: string
 ): Promise<{ data: StrategyResult; usage: any }> => {
   
-  // UPGRADE: Using 'gemini-3-pro-preview' for creative strategy
   const model = 'gemini-3-pro-preview';
-
-  // Backwards compatibility for min/max
   const targetMin = options.duration.target_minutes || Math.ceil(options.duration.target_value / 60) || 5;
 
-  const styleGuard = `STYLE LOCK: Channel Tone: "${channel.tone}". Niche: "${channel.niche}". Audience: "${channel.audienceDescription}".`;
-  const durationConstraint = `Target Duration: ${targetMin} minutes.
-  CRITICAL: Adjust the scope of the idea to fit this duration exactly. 
-  ${targetMin > 20 ? "For long videos, choose deep, complex topics requiring detailed analysis." : "For short videos, choose focused, singular topics."}`;
-
   const systemInstruction = `You are a StrategyDirector.
-${styleGuard}
-${durationConstraint}
+STYLE LOCK: Channel Tone: "${channel.tone}".
+Duration Goal: ${targetMin} minutes.
 Task: Choose ONE strong video idea and angle.
-Rules:
-- Output JSON only.
-- Be concise.
-- Focus on high retention (CTR/AVD).
-- Do not use newlines in JSON strings.`;
+Output JSON only.`;
 
-  const prompt = `
-Inputs:
-- Topic: ${topic}
-- Type: ${options.videoType}
-- Language: ${channel.language}
-- Target Duration: ${targetMin} min
-
+  const prompt = `Topic: ${topic}. Type: ${options.videoType}. Target Duration: ${targetMin} min.
 Required JSON Output: Idea, Angle, Hooks (array), Promise, Outline (array of 5-8 items).`;
 
   const schema: Schema = {
@@ -583,11 +473,10 @@ Required JSON Output: Idea, Angle, Hooks (array), Promise, Outline (array of 5-8
     required: ["idea", "angle", "hooks", "promise", "outline"]
   };
 
-  // Optimization: Increased to 8192 for deep outlines
   return generateStructuredContent<StrategyResult>(prompt, { temperature: 0.7, systemInstruction, schema, maxTokens: 8192 }, model, apiKey);
 };
 
-// --- 1.5 SHORTS: Hook Maker Agent (Highly Creative: 0.9) ---
+// --- 1.5 SHORTS: Hook Maker Agent ---
 
 export const runHookMakerAgent = async (
     channel: Channel,
@@ -595,21 +484,12 @@ export const runHookMakerAgent = async (
     apiKey?: string
 ): Promise<{ data: StrategyResult; usage: any }> => {
     
-    // Use Pro for high quality hooks
     const model = 'gemini-3-pro-preview';
-
-    const styleGuard = `STYLE LOCK: Channel Tone: "${channel.tone}". Language: "${channel.language}".`;
-    
     const systemInstruction = `You are a HookMaker for Viral Shorts.
-    ${styleGuard}
     Task: Create a killer hook and simple structure for a < 60s video.
-    Rules:
-    - The idea must be Explainable in 45 seconds.
-    - Focus on visual storytelling.
-    - Output must be valid JSON.`;
+    Output must be valid JSON.`;
   
-    const prompt = `Topic: ${topic}. 
-    Create a Short Video Strategy.
+    const prompt = `Topic: ${topic}. Create a Short Video Strategy.
     Output: Idea, Angle, Hooks (3 variations), Promise, Outline (3-4 bullet points max).`;
   
     const schema: Schema = {
@@ -627,47 +507,27 @@ export const runHookMakerAgent = async (
     return generateStructuredContent<StrategyResult>(prompt, { temperature: 0.9, systemInstruction, schema, maxTokens: 2000 }, model, apiKey);
 };
 
-// --- 2. Structure Agent (Planning: 0.5) ---
+// --- 2. Structure Agent ---
 
 export const runStructureAgent = async (outline: string[], duration: DurationConfig, apiKey?: string): Promise<{ data: StructureResult; usage: any }> => {
   const targetMin = duration.target_minutes || 5;
-  const minChapters = Math.max(3, Math.floor(targetMin / 8));
-  const maxChapters = Math.max(5, Math.ceil(targetMin / 5));
-
   const systemInstruction = `You are a StructureAgent.
 Duration Goal: ${targetMin} minutes.
-Rules:
-- Divide into ${minChapters}-${maxChapters} chapters.
-- Total duration must sum to approx ${targetMin * 60} seconds.
-- Keep titles and objectives very short (max 10 words).
-- Do not use newlines in JSON strings.`;
+Rules: Divide into chapters. Output JSON.`;
 
-  const prompt = `Outline: ${JSON.stringify(outline)}.
-  Required: Return 'chapters' array with title, objective, duration_seconds.`;
+  const prompt = `Outline: ${JSON.stringify(outline)}. Return 'chapters' array with title, objective, duration_seconds.`;
 
   const schema: Schema = {
     type: Type.OBJECT,
     properties: {
-      chapters: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          properties: {
-            title: { type: Type.STRING },
-            objective: { type: Type.STRING },
-            duration_seconds: { type: Type.NUMBER },
-            break_points: { type: Type.ARRAY, items: { type: Type.STRING } }
-          }
-        }
-      }
+      chapters: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { title: { type: Type.STRING }, objective: { type: Type.STRING }, duration_seconds: { type: Type.NUMBER }, break_points: { type: Type.ARRAY, items: { type: Type.STRING } } } } }
     }
   };
 
-  // Optimization: Increased to 4000
   return generateStructuredContent<StructureResult>(prompt, { temperature: 0.5, systemInstruction, schema, maxTokens: 4000 }, "gemini-3-flash-preview", apiKey);
 };
 
-// --- 3. Script Builder Agent (Creative: 0.7) ---
+// --- 3. Script Builder Agent ---
 
 export const runScriptBuilderAgent = async (
     chapters: Chapter[], 
@@ -675,20 +535,11 @@ export const runScriptBuilderAgent = async (
     apiKey?: string
 ): Promise<{ data: ScriptResult; usage: any }> => {
   
-  // UPGRADE: Scripting requires the best model
   const model = 'gemini-3-pro-preview';
-
-  const styleGuard = `STYLE LOCK: Tone: ${channel.tone}. Language: ${channel.language}.`;
-  
   const systemInstruction = `You are a ScriptBuilder.
-${styleGuard}
+Style: ${channel.tone}. Language: ${channel.language}.
 Task: Write the full narrator script.
-Rules:
-- Write in ${channel.language}.
-- Short, punchy sentences.
-- NO visual directions in the script text.
-- Match word count to duration_seconds (approx 130 words per minute).
-- Do not use newlines inside JSON strings.`;
+Rules: Short, punchy sentences. NO visual directions in the script text. Output JSON only.`;
 
   const prompt = `Chapters: ${JSON.stringify(chapters)}. Write full script content for each chapter.`;
 
@@ -696,24 +547,14 @@ Rules:
     type: Type.OBJECT,
     properties: {
       script_final: { type: Type.STRING },
-      chapters_content: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          properties: {
-            title: { type: Type.STRING },
-            content: { type: Type.STRING }
-          }
-        }
-      }
+      chapters_content: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { title: { type: Type.STRING }, content: { type: Type.STRING } } } }
     }
   };
 
-  // Optimization: INCREASED to 8192 to prevent 'Unterminated string' errors on long scripts
   return generateStructuredContent<ScriptResult>(prompt, { temperature: 0.7, systemInstruction, schema, maxTokens: 8192 }, model, apiKey);
 };
 
-// --- 3.5 SHORTS: MicroScript Builder (Strict: 0.4) ---
+// --- 3.5 SHORTS: MicroScript Builder ---
 
 export const runMicroScriptBuilderAgent = async (
     hook: string,
@@ -723,190 +564,170 @@ export const runMicroScriptBuilderAgent = async (
     apiKey?: string
 ): Promise<{ data: ScriptResult; usage: any }> => {
     
-    // Avg speaking rate ~ 150 wpm = ~2.5 words/sec.
-    // For 45s, approx 110 words max.
-    const maxWords = Math.floor(durationSec * 2.3); 
-
     const systemInstruction = `You are a MicroScriptBuilder for Shorts.
-    Duration Limit: ${durationSec} seconds (Max ~${maxWords} words).
-    Language: ${channel.language}.
-    Rules:
-    - Start immediately with the Hook.
-    - No fluff. Every word must add value.
-    - Use simple, high-energy language.
-    - Break into 4-6 mini-segments.`;
+    Duration Limit: ${durationSec} seconds. Language: ${channel.language}.
+    Rules: Start immediately with the Hook. No fluff. Break into 4-6 mini-segments.`;
 
-    const prompt = `Hook: "${hook}". 
-    Outline: ${JSON.stringify(outline)}.
-    Write a continuous script optimized for ${durationSec}s vertical video.`;
+    const prompt = `Hook: "${hook}". Outline: ${JSON.stringify(outline)}. Write a continuous script optimized for ${durationSec}s vertical video.`;
 
     const schema: Schema = {
         type: Type.OBJECT,
         properties: {
           script_final: { type: Type.STRING },
-          chapters_content: { // Reusing structure for compatibility
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                title: { type: Type.STRING }, // Segment name
-                content: { type: Type.STRING } // Segment text
-              }
-            }
-          }
+          chapters_content: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { title: { type: Type.STRING }, content: { type: Type.STRING } } } }
         }
     };
 
     return generateStructuredContent<ScriptResult>(prompt, { temperature: 0.7, systemInstruction, schema, maxTokens: 2000 }, "gemini-3-pro-preview", apiKey);
 };
 
-// --- 4. Pacing Reviewer Agent (Decision/QC: 0.2) ---
+// --- 4. Pacing Reviewer Agent ---
 
 export const runPacingReviewerAgent = async (script: string, apiKey?: string): Promise<{ data: PacingResult; usage: any }> => {
-  const systemInstruction = `You are a PacingReviewer.
-Task: Trim fluff by 10%. Keep it snappy.
-Output JSON only.
-- Do not use newlines in JSON strings.`;
-
-  const prompt = `Script: ${script.substring(0, 10000)}`; // Truncate if insanely long to prevent error
+  const systemInstruction = `You are a PacingReviewer. Task: Trim fluff by 10%. Keep it snappy. Output JSON only.`;
+  const prompt = `Script: ${script.substring(0, 10000)}`;
 
   const schema: Schema = {
     type: Type.OBJECT,
-    properties: {
-      refined_script: { type: Type.STRING },
-      notes: { type: Type.ARRAY, items: { type: Type.STRING } },
-      improvements: { type: Type.STRING }
-    }
+    properties: { refined_script: { type: Type.STRING }, notes: { type: Type.ARRAY, items: { type: Type.STRING } }, improvements: { type: Type.STRING } }
   };
 
   return generateStructuredContent<PacingResult>(prompt, { temperature: 0.2, systemInstruction, schema, maxTokens: 8192 }, "gemini-3-flash-preview", apiKey);
 };
 
-// --- 5. Title Generator Agent (Creative: 0.7) ---
+// --- 5. Title Generator Agent ---
 
 export const runTitleGeneratorAgent = async (idea: string, angle: string, language: string, apiKey?: string): Promise<{ data: TitleResult; usage: any }> => {
-  const systemInstruction = `TitleGenerator.
-Rules:
-- High CTR.
-- Language: ${language}.
-- Max 60 chars.
-- Generate 5 variations.
-- Do not use newlines in JSON strings.`;
-
+  const systemInstruction = `TitleGenerator. Rules: High CTR. Language: ${language}. Generate 5 variations. Output JSON.`;
   const prompt = `Idea: ${idea}. Angle: ${angle}.`;
 
   const schema: Schema = {
     type: Type.OBJECT,
     properties: {
-      titles: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          properties: {
-            text: { type: Type.STRING },
-            type: { type: Type.STRING, enum: ['Curiosity', 'Emotional', 'Direct', 'Informational'] }
-          }
-        }
-      }
+      titles: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { text: { type: Type.STRING }, type: { type: Type.STRING, enum: ['Curiosity', 'Emotional', 'Direct', 'Informational'] } } } }
     }
   };
 
-  // Increased to 2000 to prevent 'Unterminated string' on arrays
   return generateStructuredContent<TitleResult>(prompt, { temperature: 0.7, systemInstruction, schema, maxTokens: 2000 }, "gemini-3-flash-preview", apiKey);
 };
 
-// --- 6. Title Selector Agent (Decision: 0.2) ---
+// --- 6. Title Selector Agent ---
 
 export const runTitleSelectorAgent = async (titles: TitleVariant[], channelStyle: string, apiKey?: string): Promise<{ data: TitleSelectionResult; usage: any }> => {
-  const systemInstruction = `TitleSelector.
-Style: ${channelStyle}.
-Pick the best one for YouTube.`;
-
+  const systemInstruction = `TitleSelector. Style: ${channelStyle}. Pick the best one.`;
   const prompt = `Titles: ${JSON.stringify(titles.map(t => t.text))}.`;
 
   const schema: Schema = {
     type: Type.OBJECT,
-    properties: {
-      selected_title: { type: Type.STRING },
-      backup_title: { type: Type.STRING },
-      reasoning: { type: Type.STRING }
-    },
+    properties: { selected_title: { type: Type.STRING }, backup_title: { type: Type.STRING }, reasoning: { type: Type.STRING } },
     required: ["selected_title", "backup_title", "reasoning"]
   };
 
-  // Increased tokens to 2000 to prevent early cut-off of reasoning
   return generateStructuredContent<TitleSelectionResult>(prompt, { temperature: 0.2, systemInstruction, schema, maxTokens: 2000 }, "gemini-3-flash-preview", apiKey);
 };
 
-// --- 7. Scene Planner Agent (Planning: 0.5) ---
+// --- 7. Scene Planner Agent ---
 
 export const runScenePlannerAgent = async (script: string, visualStyle: string, apiKey?: string): Promise<{ data: ScenePlanResult; usage: any }> => {
-  const systemInstruction = `ScenePlanner.
-Style: ${visualStyle}.
-Task: Create visual scenes from script.
-Rules:
-- One scene per ~10 seconds of script.
-- Visual prompts must be descriptive English (for GenAI).
-- No text inside images.
-- Do not use newlines in JSON strings.`;
+  const systemInstruction = `ScenePlanner. Style: ${visualStyle}.
+Task: Create visual scenes from script. One scene per ~10s. Visual prompts must be descriptive English. Output JSON.`;
 
   const prompt = `Script: ${script}`;
 
   const schema: Schema = {
     type: Type.OBJECT,
     properties: {
-      scenes: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          properties: {
-            scene_id: { type: Type.STRING },
-            duration_seconds: { type: Type.NUMBER },
-            objective: { type: Type.STRING },
-            visual_prompt: { type: Type.STRING },
-            mood: { type: Type.STRING },
-            shot_type: { type: Type.STRING },
-            narration_text: { type: Type.STRING }
-          }
-        }
-      }
+      scenes: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { scene_id: { type: Type.STRING }, duration_seconds: { type: Type.NUMBER }, objective: { type: Type.STRING }, visual_prompt: { type: Type.STRING }, mood: { type: Type.STRING }, shot_type: { type: Type.STRING }, narration_text: { type: Type.STRING } } } }
     }
   };
 
-  // Optimization: Increased to 8192! This is critical for generating long lists of scenes without truncation.
   return generateStructuredContent<ScenePlanResult>(prompt, { temperature: 0.5, systemInstruction, schema, maxTokens: 8192 }, "gemini-3-flash-preview", apiKey);
 };
 
 // --- Content Generation ---
 
 export const generateSpeech = async (text: string, voiceName: string = 'Kore', apiKeyOverride?: string): Promise<Blob> => {
+    
+    // --- GEMINIGEN INTEGRATION with FALLBACK ---
+    if (voiceName.startsWith('GM')) {
+        try {
+            const providers = await db.getProviders();
+            const geminiGenProvider = providers.find(p => p.providerId === 'geminigen');
+            
+            if (geminiGenProvider && geminiGenProvider.apiKey) {
+                console.log(`[Speech] Routing to GeminiGen.AI for voice ${voiceName}`);
+                return await generateGeminiGenSpeech(text, voiceName, geminiGenProvider.apiKey);
+            }
+        } catch (e: any) {
+            console.warn(`[Speech] GeminiGen failed for ${voiceName}. Falling back to standard Gemini. Error: ${e.message}`);
+            // Fallback strategy: Map to a standard voice
+            // Ideally we'd map male/female, but 'Kore' is a safe default female/neutral voice.
+            // 'Fenrir' is male.
+            // Simplified fallback:
+            voiceName = 'Kore'; 
+        }
+    }
+    
+    // --- GOOGLE GEMINI TTS (Default) ---
     const apiKey = getApiKey(apiKeyOverride);
     const ai = new GoogleGenAI({ apiKey });
 
     return withRetry(async () => {
-        const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash-preview-tts", 
-            contents: { parts: [{ text }] },
-            config: {
-                responseModalities: [Modality.AUDIO],
-                speechConfig: {
-                    voiceConfig: {
-                        prebuiltVoiceConfig: { voiceName }
+        try {
+            const response = await ai.models.generateContent({
+                model: "gemini-2.5-flash-preview-tts", 
+                // Ensure contents is an array of Content objects, each with a parts array.
+                contents: [{ parts: [{ text: text }] }],
+                config: {
+                    responseModalities: ['AUDIO'],
+                    speechConfig: {
+                        voiceConfig: {
+                            prebuiltVoiceConfig: { voiceName }
+                        }
                     }
                 }
+            });
+
+            const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+            if (!base64Audio) throw new Error("No audio data received");
+
+            const binaryString = atob(base64Audio);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
             }
-        });
 
-        const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-        if (!base64Audio) throw new Error("No audio data received");
+            return pcmToWav(bytes);
+        } catch (e: any) {
+            // Auto-repair for invalid voices (common user error or deprecated voice names)
+            if (isVoiceError(e)) {
+                console.warn(`Voice '${voiceName}' is not supported. Retrying with default 'Kore'...`);
+                // Retry specifically with 'Kore'
+                const response = await ai.models.generateContent({
+                    model: "gemini-2.5-flash-preview-tts", 
+                    contents: [{ parts: [{ text: text }] }],
+                    config: {
+                        responseModalities: ['AUDIO'],
+                        speechConfig: {
+                            voiceConfig: {
+                                prebuiltVoiceConfig: { voiceName: 'Kore' }
+                            }
+                        }
+                    }
+                });
+                
+                const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+                if (!base64Audio) throw new Error("No audio data received from fallback voice");
 
-        const binaryString = atob(base64Audio);
-        const bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) {
-            bytes[i] = binaryString.charCodeAt(i);
+                const binaryString = atob(base64Audio);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+                return pcmToWav(bytes);
+            }
+            throw e;
         }
-
-        return pcmToWav(bytes);
     });
 };
 
@@ -914,14 +735,13 @@ export const generateImage = async (prompt: string, apiKeyOverride?: string): Pr
     const apiKey = getApiKey(apiKeyOverride);
     const ai = new GoogleGenAI({ apiKey });
 
+    // Chain: Gemini 2.5 Image -> Imagen 3 -> Error
     return withRetry(async () => {
         // 1. Try Gemini 2.5 Flash Image first
         try {
             const response = await ai.models.generateContent({
                 model: 'gemini-2.5-flash-image',
-                contents: {
-                    parts: [{ text: prompt }]
-                }
+                contents: { parts: [{ text: prompt }] }
             });
 
             if (response.candidates?.[0]?.content?.parts) {
@@ -933,6 +753,7 @@ export const generateImage = async (prompt: string, apiKeyOverride?: string): Pr
             }
         } catch (e: any) {
             console.warn("gemini-2.5-flash-image failed, attempting fallback to Imagen 3...", e.message);
+            // Don't throw quota errors yet, try fallback first
         }
 
         // 2. Fallback to Imagen 3
@@ -940,11 +761,7 @@ export const generateImage = async (prompt: string, apiKeyOverride?: string): Pr
             const response = await ai.models.generateImages({
                 model: "imagen-3.0-generate-001",
                 prompt: prompt,
-                config: {
-                    numberOfImages: 1,
-                    aspectRatio: "16:9",
-                    outputMimeType: "image/jpeg"
-                }
+                config: { numberOfImages: 1, aspectRatio: "16:9", outputMimeType: "image/jpeg" }
             });
 
             const base64Data = response.generatedImages?.[0]?.image?.imageBytes;
@@ -952,6 +769,7 @@ export const generateImage = async (prompt: string, apiKeyOverride?: string): Pr
                 return `data:image/jpeg;base64,${base64Data}`;
             }
         } catch (e: any) {
+            console.error("Imagen 3 failed", e);
             throw e;
         }
         
@@ -966,15 +784,13 @@ export const generateVideo = async (prompt: string, options: { model?: string, a
     const modelName = options.model || 'veo-3.1-fast-generate-preview';
     const aspectRatio = options.aspectRatio || '16:9';
 
+    // Veo doesn't have an easy fallback other than maybe older Veo or just failing gracefully.
+    // We stick to the requested model but add robust retry.
     return withRetry(async () => {
         let operation = await ai.models.generateVideos({
             model: modelName, 
             prompt: prompt,
-            config: {
-                numberOfVideos: 1,
-                resolution: '720p',
-                aspectRatio: aspectRatio 
-            }
+            config: { numberOfVideos: 1, resolution: '720p', aspectRatio: aspectRatio }
         });
 
         const maxRetries = 60; 

@@ -1,6 +1,29 @@
 
 import { SceneDefinition } from '../types';
 
+const CORS_PROXY = 'https://corsproxy.io/?';
+
+/**
+ * Helper to fetch resources that might be blocked by CORS (e.g. external music links).
+ */
+async function fetchWithCors(url: string): Promise<Response> {
+    try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`Status ${res.status}`);
+        return res;
+    } catch (e) {
+        console.warn(`[VideoAssembler] Direct fetch failed for ${url}, trying proxy...`);
+        try {
+            // Try via CORS Proxy
+            const proxyUrl = CORS_PROXY + encodeURIComponent(url);
+            return await fetch(proxyUrl);
+        } catch (proxyErr) {
+            console.error(`[VideoAssembler] Proxy fetch also failed for ${url}`, proxyErr);
+            throw e;
+        }
+    }
+}
+
 export const assembleVideo = async (
     scenes: SceneDefinition[], 
     aspectRatio: '16:9' | '9:16' = '16:9', 
@@ -41,7 +64,11 @@ export const assembleVideo = async (
   // 1. Load Global Audio (Narration) if present
   if (globalAudioUrl) {
       try {
-          const response = await fetch(globalAudioUrl);
+          // Use direct fetch for Blob URLs (created locally), helper for remote
+          const response = globalAudioUrl.startsWith('blob:') 
+              ? await fetch(globalAudioUrl) 
+              : await fetchWithCors(globalAudioUrl);
+              
           const arrayBuffer = await response.arrayBuffer();
           globalAudioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
           
@@ -61,12 +88,12 @@ export const assembleVideo = async (
   // 2. Load Background Music if present
   if (backgroundMusicUrl) {
       try {
-          const response = await fetch(backgroundMusicUrl);
+          const response = await fetchWithCors(backgroundMusicUrl);
           const arrayBuffer = await response.arrayBuffer();
           musicBuffer = await audioCtx.decodeAudioData(arrayBuffer);
           console.log(`Background Music Loaded. Duration: ${musicBuffer.duration.toFixed(2)}s`);
       } catch (e) {
-          console.warn("Failed to load background music", e);
+          console.warn("Failed to load background music - proceeding without it", e);
       }
   }
 
@@ -99,22 +126,46 @@ export const assembleVideo = async (
       // 2. Load Visuals
       if (scene.generatedVideoUrl) {
           const vid = document.createElement('video');
+          vid.crossOrigin = "anonymous"; // Important for canvas
           vid.src = scene.generatedVideoUrl;
-          vid.crossOrigin = "anonymous";
-          vid.muted = true; // Important for canvas capture
-          await new Promise((resolve) => {
-              vid.onloadeddata = resolve;
-              vid.onerror = resolve;
-          });
-          visualElement = vid;
-          isVideoSource = true;
+          vid.muted = true; 
+          
+          // Pre-load logic with error handling
+          try {
+              await new Promise((resolve, reject) => {
+                  vid.onloadeddata = resolve;
+                  vid.onerror = (e) => {
+                      console.warn("Video load error", e); 
+                      // Fallback: Resolve anyway to skip or handle gracefully
+                      resolve(null); 
+                  };
+                  // Timeout fallback
+                  setTimeout(() => resolve(null), 5000);
+              });
+              visualElement = vid;
+              isVideoSource = true;
+          } catch(e) {
+              console.warn("Failed to load video element", e);
+          }
+
       } else if (scene.generatedImageUrl) {
           const img = new Image();
-          img.src = scene.generatedImageUrl;
           img.crossOrigin = "anonymous";
+          
+          // Handle remote images via proxy if needed (basic check)
+          let src = scene.generatedImageUrl;
+          if (src.startsWith('http') && !src.includes('placehold.co') && !src.includes('corsproxy')) {
+               // Optional: Use proxy for images too if strict CORS
+               // src = CORS_PROXY + encodeURIComponent(src); 
+          }
+          img.src = src;
+
           await new Promise((resolve) => {
               img.onload = resolve;
-              img.onerror = resolve;
+              img.onerror = () => {
+                  console.warn("Image load failed", src);
+                  resolve(null);
+              };
           });
           visualElement = img;
       }
@@ -166,7 +217,7 @@ export const assembleVideo = async (
     // --- Playback & Recording Loop ---
     
     // We need to schedule audio playback relative to AudioContext time
-    let startTime = audioCtx.currentTime;
+    let startTime = audioCtx.currentTime + 0.1; // Add slight buffer
 
     // Schedule Global Audio ONE time at start if exists (Narration)
     if (globalAudioBuffer) {
@@ -183,7 +234,6 @@ export const assembleVideo = async (
         source.loop = true; // Loop the music
         
         // Convert dB to linear gain
-        // Formula: gain = 10 ^ (dB / 20)
         const gainValue = Math.pow(10, musicVolumeDb / 20);
         
         const gainNode = audioCtx.createGain();
@@ -196,7 +246,14 @@ export const assembleVideo = async (
     }
 
     for (const scene of loadedScenes) {
-        if (!scene.visualElement) continue;
+        // Fallback for missing visuals
+        if (!scene.visualElement) {
+            // Draw placeholder
+            ctx.fillStyle = '#111';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = '#555';
+            ctx.fillText("Visual Missing", canvas.width/2, canvas.height/2);
+        }
 
         // Schedule Per-Scene Audio (Legacy / Fallback)
         if (scene.audioBuffer && !globalAudioBuffer) {
@@ -207,17 +264,9 @@ export const assembleVideo = async (
         }
 
         // Play Video Element if exists
-        if (scene.isVideoSource) {
+        if (scene.isVideoSource && scene.visualElement) {
             const vid = scene.visualElement as HTMLVideoElement;
             vid.currentTime = 0;
-            // Adjust playback rate if we are scaling video duration
-            if (globalAudioBuffer) {
-                 // original duration vs scaled duration
-                 // Assuming original video is roughly the prompt duration (e.g. 5s)
-                 // This is tricky without knowing exact source video duration. 
-                 // For Veo it's usually ~5-7s. We won't stretch playback rate to avoid weird motion, we'll just loop or cut.
-                 // Actually, if we scale down, we cut. If we scale up, we pause on last frame (simpler than looping).
-            }
             vid.play().catch(e => console.error("Video play failed", e));
         }
 
@@ -228,50 +277,54 @@ export const assembleVideo = async (
             ctx.fillStyle = '#000'; // Clear black
             ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-            if (scene.isVideoSource) {
-                 const vid = scene.visualElement as HTMLVideoElement;
-                 drawImageProp(ctx, vid, 0, 0, canvas.width, canvas.height);
-            } else {
-                 const img = scene.visualElement as HTMLImageElement;
-                 // Simple Zoom Effect (Ken Burns Lite)
-                 const elapsed = Date.now() - sceneStartTimestamp;
-                 const scale = 1 + (elapsed / scene.actualDurationMs) * 0.05; // 5% zoom
-                 
-                 const cx = canvas.width / 2;
-                 const cy = canvas.height / 2;
-                 
-                 ctx.save();
-                 ctx.translate(cx, cy);
-                 ctx.scale(scale, scale);
-                 ctx.translate(-cx, -cy);
-                 drawImageProp(ctx, img, 0, 0, canvas.width, canvas.height);
-                 ctx.restore();
+            if (scene.visualElement) {
+                if (scene.isVideoSource) {
+                     const vid = scene.visualElement as HTMLVideoElement;
+                     drawImageProp(ctx, vid, 0, 0, canvas.width, canvas.height);
+                } else {
+                     const img = scene.visualElement as HTMLImageElement;
+                     // Simple Zoom Effect (Ken Burns Lite)
+                     const elapsed = Date.now() - sceneStartTimestamp;
+                     const scale = 1 + (elapsed / scene.actualDurationMs) * 0.05; // 5% zoom
+                     
+                     const cx = canvas.width / 2;
+                     const cy = canvas.height / 2;
+                     
+                     ctx.save();
+                     ctx.translate(cx, cy);
+                     ctx.scale(scale, scale);
+                     ctx.translate(-cx, -cy);
+                     drawImageProp(ctx, img, 0, 0, canvas.width, canvas.height);
+                     ctx.restore();
+                }
             }
             
             // Overlay Subtitles
             if (scene.narration_text) {
                 const text = scene.narration_text;
-                ctx.fillStyle = 'rgba(0,0,0,0.7)';
+                ctx.fillStyle = 'rgba(0,0,0,0.6)';
                 const measure = ctx.measureText(text);
                 const textW = Math.min(measure.width, canvas.width - 40); 
                 
                 // Background bar
-                const barY = canvas.height - 100;
-                ctx.fillRect((canvas.width - textW - 40) / 2, barY, textW + 40, 70);
+                const barY = canvas.height - 120;
+                ctx.fillRect((canvas.width - textW - 40) / 2, barY, textW + 40, 90);
                 
                 ctx.fillStyle = 'white';
-                // Very basic wrapping or truncation
-                if (measure.width > (canvas.width - 40)) {
-                     ctx.fillText(text.substring(0, 80) + "...", canvas.width / 2, barY + 50);
+                // Very basic wrapping
+                if (measure.width > (canvas.width - 60)) {
+                     const splitIdx = Math.floor(text.length / 2);
+                     ctx.fillText(text.substring(0, splitIdx), canvas.width / 2, barY + 40);
+                     ctx.fillText(text.substring(splitIdx), canvas.width / 2, barY + 80);
                 } else {
-                     ctx.fillText(text, canvas.width / 2, barY + 50);
+                     ctx.fillText(text, canvas.width / 2, barY + 60);
                 }
             }
             
             await new Promise(r => requestAnimationFrame(r));
         }
 
-        if (scene.isVideoSource) {
+        if (scene.isVideoSource && scene.visualElement) {
             (scene.visualElement as HTMLVideoElement).pause();
         }
 
@@ -334,5 +387,9 @@ function drawImageProp(ctx: CanvasRenderingContext2D, img: HTMLImageElement | HT
     if (ch > ih) ch = ih;
 
     // fill image in dest. rectangle
-    ctx.drawImage(img, cx, cy, cw, ch,  x, y, w, h);
+    try {
+        ctx.drawImage(img, cx, cy, cw, ch,  x, y, w, h);
+    } catch(e) {
+        // Ignore draw errors (e.g. video not ready)
+    }
 }

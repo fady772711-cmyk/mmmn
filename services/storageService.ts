@@ -15,7 +15,7 @@ const KEYS = {
   PLANS: 'av_daily_plans',
   YT_CONFIG: 'av_yt_config',
   GLOBAL_USAGE: 'av_global_usage',
-  AUTH_SETTINGS: 'av_auth_settings',
+  AUTH_SETTINGS: 'av_app_settings',
   APP_SETTINGS: 'av_app_settings',
   ADMIN_JOBS: 'av_admin_jobs',
   DEV_TICKETS: 'av_dev_tickets',
@@ -44,12 +44,29 @@ const SEED_PROVIDERS: ProviderConfig[] = [
       models: ['gpt-4o', 'gpt-4-turbo', 'gpt-3.5-turbo']
   },
   { id: 'prov_2', name: 'Midjourney (Simulated)', type: ProviderType.IMAGE, providerId: 'midjourney', isEnabled: false, status: 'untested' },
-  { id: 'prov_3', name: 'ElevenLabs', type: ProviderType.VOICE, providerId: 'elevenlabs', isEnabled: true, status: 'untested' }
+  { id: 'prov_3', name: 'ElevenLabs', type: ProviderType.VOICE, providerId: 'elevenlabs', isEnabled: true, status: 'untested' },
+  { 
+      id: 'prov_geminigen', 
+      name: 'GeminiGen.AI', 
+      type: ProviderType.VOICE, 
+      providerId: 'geminigen', 
+      isEnabled: true, 
+      status: 'operational',
+      apiKey: 'geminiai-5748d0eefb448c8327ede6c1c160bfd3'
+  }
 ];
 
+// Seed a wide range of GeminiGen voices
 const SEED_VOICES: VoicePreset[] = [
-  { id: 'voice_1', name: 'Rami (Deep)', providerId: 'prov_3', nativeVoiceId: 'rami_123', gender: 'Male', style: 'Documentary', languageCode: 'ar-SA' },
-  { id: 'voice_2', name: 'Layla (News)', providerId: 'prov_3', nativeVoiceId: 'layla_456', gender: 'Female', style: 'News', languageCode: 'ar-AE' }
+  { id: 'voice_1', name: 'Fenrir (Deep)', providerId: 'prov_1', nativeVoiceId: 'fenrir', gender: 'Male', style: 'Documentary', languageCode: 'ar-SA' },
+  { id: 'voice_2', name: 'Zephyr (News)', providerId: 'prov_1', nativeVoiceId: 'zephyr', gender: 'Female', style: 'News', languageCode: 'ar-AE' },
+  
+  // GeminiGen Voices Seeds
+  { id: 'gm_001', name: 'GeminiGen - Standard Male', providerId: 'prov_geminigen', nativeVoiceId: 'GM001', gender: 'Male', style: 'Standard', languageCode: 'en-US' },
+  { id: 'gm_002', name: 'GeminiGen - Standard Female', providerId: 'prov_geminigen', nativeVoiceId: 'GM002', gender: 'Female', style: 'Standard', languageCode: 'en-US' },
+  { id: 'gm_013', name: 'GeminiGen - Gacrux (Deep)', providerId: 'prov_geminigen', nativeVoiceId: 'GM013', gender: 'Male', style: 'Deep', languageCode: 'en-US' },
+  { id: 'gm_014', name: 'GeminiGen - Kore (Clear)', providerId: 'prov_geminigen', nativeVoiceId: 'GM014', gender: 'Female', style: 'Clear', languageCode: 'en-US' },
+  { id: 'gm_015', name: 'GeminiGen - Charon (Story)', providerId: 'prov_geminigen', nativeVoiceId: 'GM015', gender: 'Male', style: 'Story', languageCode: 'en-US' }
 ];
 
 // ... (Rest of existing methods until Automation)

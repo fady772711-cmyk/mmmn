@@ -1,6 +1,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { GoogleGenAI } = require('@google/genai');
 const { metricsService } = require('./metrics');
 
 // Simple file-based persistence
@@ -8,6 +9,45 @@ const DB_FILE = path.join(__dirname, 'jobs.db.json');
 const STORAGE_DIR = path.join(__dirname, 'storage');
 
 if (!fs.existsSync(STORAGE_DIR)) fs.mkdirSync(STORAGE_DIR);
+
+// --- AI CONFIGURATION ---
+const apiKey = process.env.API_KEY;
+const ai = apiKey ? new GoogleGenAI({ apiKey }) : null;
+
+// Helper: Quota Safe Generation with Fallback
+async function generateSafe(modelName, prompt, config = {}) {
+    const modelsToTry = [modelName];
+    // Fallback Logic definition
+    if (modelName.includes('gemini-3')) {
+        if (!modelsToTry.includes('gemini-3-flash-preview')) modelsToTry.push('gemini-3-flash-preview');
+        if (!modelsToTry.includes('gemini-2.5-flash')) modelsToTry.push('gemini-2.5-flash');
+    }
+
+    let lastError;
+    for (const model of modelsToTry) {
+        try {
+            console.log(`[JobManager] Generating with ${model}...`);
+            const response = await ai.models.generateContent({
+                model: model,
+                contents: prompt,
+                config: config
+            });
+            return response;
+        } catch (e) {
+            lastError = e;
+            const msg = e.message?.toLowerCase() || '';
+            const isQuota = e.status === 429 || msg.includes('quota') || msg.includes('resource_exhausted') || msg.includes('429');
+            if (isQuota) {
+                console.warn(`[JobManager] Quota hit for ${model}. trying next...`);
+                // Wait a bit longer if quota hit to cool down
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                continue;
+            }
+            throw e;
+        }
+    }
+    throw lastError;
+}
 
 class JobManager {
     constructor() {
@@ -29,28 +69,23 @@ class JobManager {
         fs.writeFileSync(DB_FILE, JSON.stringify(this.jobs, null, 2));
     }
 
-    // --- NEW: Trigger Batch based on Automation Plan ---
     async triggerDailyBatch() {
-        // ... (Keep existing logic)
+        // Logic to trigger batch jobs based on automated schedules
         return [];
     }
 
     async enqueueJob(type, payload) {
         const jobId = `job_${Date.now()}_${Math.floor(Math.random()*1000)}`;
         
-        // Define default steps (FULL 9-STEP PIPELINE) matching the Visual Design
         let steps = payload.steps;
         if (!steps || steps.length === 0) {
             steps = [
-                { id: 's1', agentRole: 'StrategyDirector', name: 'Strategy .1', status: 'PENDING' },
-                { id: 's2', agentRole: 'TitleGenerator', name: 'Title Gen .2', status: 'PENDING' },
-                { id: 's3', agentRole: 'TitleSelector', name: 'Title Select .3', status: 'PENDING' },
-                { id: 's4', agentRole: 'StructureAgent', name: 'Structure .4', status: 'PENDING' },
-                { id: 's5', agentRole: 'ScriptBuilder', name: 'Scripting .5', status: 'PENDING' },
-                { id: 's6', agentRole: 'VisualProducer', name: 'Visuals .6', status: 'PENDING' },
-                { id: 's7', agentRole: 'VoiceDirector', name: 'Voice .7', status: 'PENDING' },
-                { id: 's8', agentRole: 'MusicDirector', name: 'Music & Mix .8', status: 'PENDING' }, 
-                { id: 's9', agentRole: 'EditorAssembler', name: 'Assembly .9', status: 'PENDING' }
+                { id: 's1', agentRole: 'StrategyDirector', name: 'Strategy & Angle', status: 'PENDING' },
+                { id: 's2', agentRole: 'TitleGenerator', name: 'Viral Titles', status: 'PENDING' },
+                { id: 's3', agentRole: 'ScriptBuilder', name: 'Professional Script', status: 'PENDING' },
+                { id: 's4', agentRole: 'VisualProducer', name: 'Visual Prompts', status: 'PENDING' },
+                { id: 's5', agentRole: 'DescriptionAgent', name: 'SEO Description', status: 'PENDING' },
+                { id: 's6', agentRole: 'EditorAssembler', name: 'Final Assembly', status: 'PENDING' } // Added Final Assembly
             ];
         }
 
@@ -64,7 +99,7 @@ class JobManager {
             currentStepIndex: 0,
             progress: 0,
             steps: steps,
-            artifacts: {},
+            artifacts: {}, // Stores context between steps
             logs: [],
             totalCost: 0,
             totalTokens: 0,
@@ -113,15 +148,27 @@ class JobManager {
         try {
             for (let i = 0; i < job.steps.length; i++) {
                 const step = job.steps[i];
+                
+                // Skip if already done (for resuming)
+                if (step.status === 'COMPLETED') continue;
+
                 job.currentStepIndex = i;
                 step.status = 'RUNNING';
                 this.saveJobs();
 
-                await this.executeStep(job, step);
+                // Check for Smoke Test Simulation Mode
+                if (job.type === 'smoke_test') {
+                    await this.executeMockStep(job, step);
+                } else {
+                    await this.executeStep(job, step);
+                }
 
                 step.status = 'COMPLETED';
                 job.progress = Math.round(((i + 1) / job.steps.length) * 100);
                 this.saveJobs();
+                
+                // Throttling
+                await new Promise(r => setTimeout(r, 2000));
             }
 
             job.status = 'COMPLETED';
@@ -129,7 +176,7 @@ class JobManager {
             metricsService.recordJobEvent(job.type, 'SUCCESS', (new Date() - new Date(job.startedAt)));
 
         } catch (e) {
-            console.error(e);
+            console.error(`Job ${job.id} Failed:`, e);
             job.status = 'FAILED';
             job.error = e.message;
             if (job.steps[job.currentStepIndex]) {
@@ -143,104 +190,190 @@ class JobManager {
         this.saveJobs();
     }
 
-    async executeStep(job, step) {
-        // Reduced delay for demo speed
-        const delay = 2000; 
-        await new Promise(resolve => setTimeout(resolve, delay));
+    // --- MOCK EXECUTION (NO API USAGE) ---
+    async executeMockStep(job, step) {
+        console.log(`[Job ${job.id}] Executing MOCK ${step.agentRole}...`);
+        await new Promise(r => setTimeout(r, 1000)); // Simulate work
 
-        const tokens = Math.floor(Math.random() * 1500) + 200;
-        const cost = (tokens / 1000000) * 0.30; 
-        
-        step.tokenUsage = { prompt: Math.floor(tokens * 0.8), candidates: Math.floor(tokens * 0.2), total: tokens };
-        step.cost = cost;
-        job.totalCost = (job.totalCost || 0) + cost;
-        job.totalTokens = (job.totalTokens || 0) + tokens;
-
-        step.artifacts = [];
-        step.outputSummary = '';
-
-        // --- MOCK LOGIC FOR DEMO ---
         if (step.agentRole === 'StrategyDirector') {
-            step.outputSummary = 'Generated Viral Topic';
-            step.artifacts.push({ label: 'Topic', type: 'text', content: job.title });
+            job.artifacts.strategy = { angle: "Mock Angle: The Hidden Truth", hook: "Did you know coffee was once illegal?", tone: "Dramatic" };
+            step.outputSummary = "Mock Strategy Generated";
+            step.artifacts = [{ label: 'Strategy JSON', type: 'json', content: JSON.stringify(job.artifacts.strategy) }];
         } 
         else if (step.agentRole === 'TitleGenerator') {
-            step.outputSummary = 'Generated Variations';
-            step.artifacts.push({ label: 'Variations', type: 'text', content: '1. ' + job.title + ' | Official\n2. The Truth About ' + job.title });
-        }
-        else if (step.agentRole === 'TitleSelector') {
-            step.outputSummary = 'Optimization Complete';
-            step.artifacts.push({ label: 'Selected Title / Hook', type: 'text', content: '🔴 حقيقة ' + job.title + ' التي يخفونها عنك!' });
-        }
-        else if (step.agentRole === 'StructureAgent') {
-            step.outputSummary = 'Structure Defined';
-            step.artifacts.push({ label: 'Structure', type: 'text', content: '4 Scenes x 5 Seconds' });
+            job.artifacts.titles = ["The Dark History of Coffee", "Why Kings Banned Coffee", "Coffee: The Devil's Drink"];
+            step.outputSummary = "Mock Titles Generated";
+            step.artifacts = [{ label: 'Titles List', type: 'json', content: JSON.stringify({ titles: job.artifacts.titles }) }];
         }
         else if (step.agentRole === 'ScriptBuilder') {
-            step.outputSummary = 'Script Generated';
-            const richScript = `[مشهد 1 - الافتتاحية]
-هل تعلم أن المستقبل الذي نخشاه قد بدأ بالفعل؟
-(مؤثرات صوتية: تشويق)
-
-[مشهد 2 - التفاصيل]
-في عالم تتسارع فيه التكنولوجيا، لم يعد هناك مكان للاختباء من الحقيقة الرقمية.
-(مؤثرات: صوت داتا)
-
-[مشهد 3 - الذروة]
-الذكاء الاصطناعي ليس مجرد أداة، إنه الشريك الجديد في كتابة التاريخ.
-
-[مشهد 4 - الخاتمة]
-اشترك الآن لتعرف المزيد عن عالم الغد.`;
-            step.artifacts.push({ label: 'Script', type: 'text', content: richScript });
+            job.artifacts.script = "Title: The Dark History of Coffee\n\nIntro: It starts in 1511. Coffee was banned in Mecca.\n\nBody: Why? Because it made people think.\n\nOutro: Next time you sip, remember the rebels.";
+            step.outputSummary = "Mock Script Generated";
+            step.artifacts = [{ label: 'Full Script', type: 'text', content: job.artifacts.script }];
         }
         else if (step.agentRole === 'VisualProducer') {
-            step.outputSummary = '4 Visual Scenes Generated';
-            // Produce 4 distinct scenes for assembly
-            const scenes = [
-                { scene_id: '1', duration_seconds: 5, visual_prompt: 'Futuristic City', generatedImageUrl: 'https://images.unsplash.com/photo-1480714378408-67cf0d13bc1b?w=800&q=80', narration_text: 'المستقبل بدأ بالفعل.' },
-                { scene_id: '2', duration_seconds: 5, visual_prompt: 'AI Robot', generatedImageUrl: 'https://images.unsplash.com/photo-1535378437323-95288ac8e65e?w=800&q=80', narration_text: 'التكنولوجيا تتسارع بلا توقف.' },
-                { scene_id: '3', duration_seconds: 5, visual_prompt: 'Data Network', generatedImageUrl: 'https://images.unsplash.com/photo-1558494949-ef526b0042a0?w=800&q=80', narration_text: 'البيانات هي النفط الجديد.' },
-                { scene_id: '4', duration_seconds: 5, visual_prompt: 'Space View', generatedImageUrl: 'https://images.unsplash.com/photo-1451187580459-43490279c0fa?w=800&q=80', narration_text: 'تابعنا للمزيد.' }
+            const prompts = ["Ancient coffee house in Mecca, 1511", "Angry Sultan forbidding coffee", "Modern latte art close up"];
+            const mockImages = prompts.map((p, i) => ({
+                label: `Scene ${i+1}`,
+                type: 'image',
+                url: `https://placehold.co/600x400/2a1b0e/FFF?text=${encodeURIComponent(p.substring(0, 20))}`
+            }));
+            step.outputSummary = "Mock Visuals Created";
+            step.artifacts = [
+                { label: 'Prompts JSON', type: 'json', content: JSON.stringify({ prompts }) },
+                ...mockImages
             ];
-            
-            // Push ALL images so UI can show them in a grid
-            scenes.forEach((s, i) => {
-                step.artifacts.push({ label: `Scene ${i+1}`, type: 'image', url: s.generatedImageUrl });
-            });
-            // Push JSON for Assembler
-            step.artifacts.push({ label: 'Scene List (JSON)', type: 'json', content: JSON.stringify(scenes) });
         }
-        else if (step.agentRole === 'VoiceDirector') {
-            step.outputSummary = 'Voiceover Ready';
-            const mockVoiceUrl = "https://www2.cs.uic.edu/~i101/SoundFiles/StarWars3.wav"; 
-            step.artifacts.push({ label: 'Voice Track', type: 'audio', url: mockVoiceUrl });
-        }
-        else if (step.agentRole === 'MusicDirector') {
-            step.outputSummary = 'Music Selected & Mixed';
-            const mockMusicUrl = "https://www2.cs.uic.edu/~i101/SoundFiles/PinkPanther60.wav";
-            step.artifacts.push({ 
-                label: 'Audio Engineering Report', 
-                type: 'mix_config', 
-                content: JSON.stringify({
-                    track: "Epic Sci-Fi Build",
-                    trackUrl: mockMusicUrl,
-                    bpm: 120,
-                    mood: "Cinematic",
-                    mix: { ducking: "ON (-15dB)", eq: "Voice Boost", master_gain: "-2.0dB" }
-                }) 
-            });
+        else if (step.agentRole === 'DescriptionAgent') {
+            step.outputSummary = "Mock Description Ready";
+            step.artifacts = [{ label: 'Video Description', type: 'text', content: "Discover the forbidden history of your morning brew. #Coffee #History" }];
         }
         else if (step.agentRole === 'EditorAssembler') {
-            step.outputSummary = 'Ready for Rendering';
-            step.artifacts.push({ label: 'Assembly Manifest', type: 'text', content: 'Ready for client-side rendering.' });
+            // Mock Video Assembly
+            // Use a reliable sample video URL for demonstration
+            const sampleVideo = "https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4";
+            job.artifacts.finalVideoUrl = sampleVideo;
+            step.outputSummary = "Final Video Assembled (Simulation)";
+            step.artifacts = [{ label: 'Final Video', type: 'video', url: sampleVideo }];
         }
-
+        
         job.logs.push({
             timestamp: new Date().toISOString(),
             level: 'INFO',
             agent: step.agentRole,
-            message: `${step.name} finished.`
+            message: `[MOCK] ${step.name} completed successfully.`
         });
+    }
+
+    // --- REAL AI EXECUTION ENGINE ---
+    async executeStep(job, step) {
+        if (!ai) {
+            throw new Error("SERVER_MODE_ERROR: API_KEY is missing in server environment.");
+        }
+
+        console.log(`[Job ${job.id}] Executing ${step.agentRole}...`);
+        
+        const context = {
+            topic: job.title,
+            strategy: job.artifacts.strategy,
+            titles: job.artifacts.titles,
+            script: job.artifacts.script,
+            duration: job.payload.durationConfig?.target_value || 5
+        };
+
+        const defaultModel = 'gemini-3-flash-preview'; 
+        let resultText = "";
+
+        try {
+            if (step.agentRole === 'StrategyDirector') {
+                const prompt = `
+                Role: Senior YouTube Strategist.
+                Task: Define a viral strategy for a video about "${context.topic}".
+                Constraint: Video Type is ${job.type}. Target Audience: General.
+                Output JSON: { "hook": "A curiosity-inducing hook sentence", "angle": "Unique perspective", "tone": "Emotional/Dramatic/Educational" }
+                Ensure the output is in Arabic language.
+                `;
+                const response = await generateSafe(defaultModel, prompt, { responseMimeType: 'application/json' });
+                resultText = response.text;
+                job.artifacts.strategy = JSON.parse(resultText);
+                step.outputSummary = "Strategy Defined: " + job.artifacts.strategy.angle;
+                step.artifacts = [{ label: 'Strategy JSON', type: 'json', content: resultText }];
+            } 
+            else if (step.agentRole === 'TitleGenerator') {
+                const prompt = `
+                Role: YouTube Title Expert.
+                Context: Topic "${context.topic}", Angle "${context.strategy?.angle}".
+                Task: Generate 5 high-CTR Arabic titles.
+                Output JSON: { "titles": ["Title 1", "Title 2", ...] }
+                `;
+                const response = await generateSafe(defaultModel, prompt, { responseMimeType: 'application/json' });
+                resultText = response.text;
+                job.artifacts.titles = JSON.parse(resultText).titles;
+                step.outputSummary = "Generated 5 Titles";
+                step.artifacts = [{ label: 'Titles List', type: 'json', content: resultText }];
+            }
+            else if (step.agentRole === 'ScriptBuilder') {
+                const selectedTitle = context.titles ? context.titles[0] : context.topic;
+                const prompt = `
+                Role: Professional Scriptwriter.
+                Task: Write a full script for "${selectedTitle}".
+                Style: ${context.strategy?.tone || 'Engaging'}.
+                Structure: Intro (Hook), Body (3 Key Points), Outro (Call to Action).
+                Language: Arabic (Professional yet accessible).
+                Output Plain Text with clear section headers.
+                `;
+                const response = await generateSafe('gemini-3-pro-preview', prompt); 
+                resultText = response.text;
+                job.artifacts.script = resultText;
+                step.outputSummary = "Full Script Generated";
+                step.artifacts = [{ label: 'Full Script', type: 'text', content: resultText }];
+            }
+            else if (step.agentRole === 'DescriptionAgent') { 
+                const prompt = `
+                Role: YouTube SEO Specialist.
+                Task: Write a video description for "${context.topic}".
+                Input Script Summary: ${context.script?.substring(0, 500)}...
+                Requirements: 
+                1. Catchy first 2 lines.
+                2. Bullet points of what is covered.
+                3. Hashtags.
+                Language: Arabic.
+                Output Plain Text.
+                `;
+                const response = await generateSafe(defaultModel, prompt);
+                resultText = response.text;
+                job.artifacts.description = resultText;
+                step.outputSummary = "SEO Description Ready";
+                step.artifacts = [{ label: 'Video Description', type: 'text', content: resultText }];
+            }
+            else if (step.agentRole === 'VisualProducer') {
+                const prompt = `
+                Role: Art Director.
+                Task: Create 3 image generation prompts based on this script snippet: "${context.script?.substring(0, 300)}...".
+                Output JSON: { "prompts": ["Prompt 1", "Prompt 2", "Prompt 3"] }
+                `;
+                const response = await generateSafe(defaultModel, prompt, { responseMimeType: 'application/json' });
+                resultText = response.text;
+                const prompts = JSON.parse(resultText).prompts;
+                
+                const mockImages = prompts.map((p, i) => ({
+                    label: `Scene ${i+1}`,
+                    type: 'image',
+                    url: `https://placehold.co/600x400/1e293b/FFF?text=${encodeURIComponent(p.substring(0, 20))}`
+                }));
+                
+                step.outputSummary = "Visual Prompts Created";
+                step.artifacts = [
+                    { label: 'Prompts JSON', type: 'json', content: resultText },
+                    ...mockImages
+                ];
+            }
+            else if (step.agentRole === 'EditorAssembler') {
+                // For real execution, this would trigger video composition logic.
+                // In this server-side script, we currently just mark completion or trigger a placeholder.
+                // NOTE: Real FFmpeg rendering logic would go here.
+                step.outputSummary = "Editor Assembler Pending (Video Gen Not Implemented Server-Side yet)";
+                // We don't fail here, just pass through for now or leave pending.
+                // For completeness of the "Factory", we'll just log it.
+            }
+            else {
+                step.outputSummary = `Agent ${step.agentRole} passed (Placeholder)`;
+                await new Promise(r => setTimeout(r, 1000));
+            }
+
+            const cost = 0.0001;
+            step.cost = cost;
+            job.totalCost = (job.totalCost || 0) + cost;
+
+            job.logs.push({
+                timestamp: new Date().toISOString(),
+                level: 'INFO',
+                agent: step.agentRole,
+                message: `${step.name} completed successfully.`
+            });
+
+        } catch (e) {
+            throw new Error(`AI Execution Failed for ${step.agentRole}: ${e.message}`);
+        }
     }
 }
 

@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
   <head>
@@ -5,6 +6,12 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>AutoVideo Factory OS</title>
+    <!-- PRECONNECT -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <!-- FONT: Cairo -->
+    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@200;300;400;500;600;700;800&display=swap" rel="stylesheet">
+    
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
       tailwind.config = {
@@ -22,7 +29,18 @@
               }
             },
             fontFamily: {
-              sans: ['Segoe UI', 'Tahoma', 'Geneva', 'Verdana', 'sans-serif'],
+              sans: ['Cairo', 'Segoe UI', 'Tahoma', 'sans-serif'],
+              mono: ['Fira Code', 'Consolas', 'monospace'],
+            },
+            animation: {
+              'pulse-slow': 'pulse 4s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+              'float': 'float 6s ease-in-out infinite',
+            },
+            keyframes: {
+              float: {
+                '0%, 100%': { transform: 'translateY(0)' },
+                '50%': { transform: 'translateY(-10px)' },
+              }
             }
           }
         }
@@ -31,11 +49,11 @@
     <style>
       /* Custom scrollbar for dark theme */
       ::-webkit-scrollbar {
-        width: 8px;
-        height: 8px;
+        width: 6px;
+        height: 6px;
       }
       ::-webkit-scrollbar-track {
-        background: #0f172a; 
+        background: transparent; 
       }
       ::-webkit-scrollbar-thumb {
         background: #334155; 
@@ -44,6 +62,40 @@
       ::-webkit-scrollbar-thumb:hover {
         background: #475569; 
       }
+      
+      body {
+        font-family: 'Cairo', sans-serif;
+        background-color: #020617;
+        overflow-x: hidden;
+      }
+
+      /* Professional Grid Background */
+      .bg-grid-pattern {
+        background-image: 
+          linear-gradient(to right, rgba(30, 41, 59, 0.1) 1px, transparent 1px),
+          linear-gradient(to bottom, rgba(30, 41, 59, 0.1) 1px, transparent 1px);
+        background-size: 40px 40px;
+        mask-image: radial-gradient(circle at center, black 40%, transparent 100%);
+        pointer-events: none;
+        position: fixed;
+        inset: 0;
+        z-index: -1;
+      }
+
+      /* Subtle Glow Orbs */
+      .glow-orb {
+        position: fixed;
+        width: 600px;
+        height: 600px;
+        border-radius: 50%;
+        filter: blur(100px);
+        opacity: 0.15;
+        z-index: -2;
+        animation: float 10s ease-in-out infinite;
+      }
+      .glow-blue { background: #3b82f6; top: -100px; left: -100px; }
+      .glow-purple { background: #a855f7; bottom: -100px; right: -100px; animation-delay: -5s; }
+
     </style>
   <script type="importmap">
 {
@@ -57,7 +109,12 @@
 }
 </script>
 </head>
-  <body class="bg-slate-950 text-slate-200">
+  <body class="bg-slate-950 text-slate-200 antialiased selection:bg-blue-500/30 selection:text-blue-200">
+    <!-- Background Effects -->
+    <div class="bg-grid-pattern"></div>
+    <div class="glow-orb glow-blue"></div>
+    <div class="glow-orb glow-purple"></div>
+    
     <div id="root"></div>
   </body>
 </html>

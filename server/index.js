@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+const os = require('os'); // Import OS module
 const { jobManager } = require('./jobManager');
 const { metricsService } = require('./metrics');
 
@@ -42,12 +43,33 @@ app.get('/api/metrics', async (req, res) => {
     res.json(data);
 });
 
+// UPGRADED HEALTH ENDPOINT
 app.get('/api/health', (req, res) => {
+    // Memory Calculation
+    const totalMem = os.totalmem();
+    const freeMem = os.freemem();
+    const usedMem = totalMem - freeMem;
+    const memUsage = Math.round((usedMem / totalMem) * 100);
+
+    // CPU Calculation (Load Avg)
+    const cpus = os.cpus();
+    const cpuCount = cpus.length;
+    const loadAvg = os.loadavg()[0]; // 1 minute load average
+    // Rough estimate of percentage based on load avg vs cores
+    let cpuUsage = Math.round((loadAvg / cpuCount) * 100);
+    if (cpuUsage > 100) cpuUsage = 100;
+
     res.json({ 
         status: 'green', 
         uptime: process.uptime(),
         workers: 1,
-        mode: 'production_server_only'
+        mode: 'production_server_only',
+        system: {
+            cpu: cpuUsage,
+            ram: memUsage,
+            totalMemGb: (totalMem / 1024 / 1024 / 1024).toFixed(1),
+            platform: os.platform()
+        }
     });
 });
 
@@ -98,7 +120,6 @@ app.post('/api/smoke/run', async (req, res) => {
 });
 
 // --- Frontend Static Serving ---
-// Assuming 'dist' contains the built React app
 const distPath = path.join(__dirname, '../dist');
 if (fs.existsSync(distPath)) {
     app.use(express.static(distPath));

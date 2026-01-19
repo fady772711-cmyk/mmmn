@@ -1,14 +1,16 @@
 
 import React, { useState, useEffect } from 'react';
-import { ProductionJob, JobStatus, AgentRole, ProductionType, Channel, ProductionStep } from '../types';
+import { ProductionJob, JobStatus, AgentRole, ProductionType, Channel, ProductionStep, SceneDefinition } from '../types';
 import { server } from '../services/serverOrchestrator';
 import { db } from '../services/storageService';
 import { assembleVideo } from '../services/videoAssembler'; 
+import { generateSpeech } from '../services/geminiService';
+import { toast } from '../services/notificationService'; // Import Toast
 import { 
     CheckCircle2, Circle, AlertCircle, Loader2, Play, 
     MonitorPlay, Smartphone, Zap, Clock, DollarSign, 
     ChevronRight, Type as TypeIcon, Music, Mic2, Sliders, Volume2, Film,
-    Eye, AlignLeft, Activity, ImageIcon, FileText, Download
+    Eye, AlignLeft, Activity, ImageIcon, FileText, Download, Edit3, Save, X, RefreshCw, Trash2, Plus, FlaskConical
 } from 'lucide-react';
 
 // --- Components ---
@@ -17,72 +19,177 @@ interface StepCardProps {
     step: ProductionStep;
     index: number;
     job: ProductionJob;
+    onUpdateStep: (updatedStep: ProductionStep) => void;
 }
 
-const StepCard: React.FC<StepCardProps> = ({ step, index, job }) => {
+const StepCard: React.FC<StepCardProps> = ({ step, index, job, onUpdateStep }) => {
     const isActive = step.status === JobStatus.RUNNING;
     const isDone = step.status === JobStatus.COMPLETED;
+    
+    // Editing State
+    const [isEditing, setIsEditing] = useState(false);
     const [rendering, setRendering] = useState(false);
+    const [regeneratingAudio, setRegeneratingAudio] = useState<number | null>(null); // Index of scene being regenerated
+    
+    // Internal State for Editors
+    const [localScript, setLocalScript] = useState('');
+    const [localScenes, setLocalScenes] = useState<SceneDefinition[]>([]);
+    const [localMix, setLocalMix] = useState<any>(null);
+
+    // Final Video State
     const [finalVideoUrl, setFinalVideoUrl] = useState<string | null>(null);
     
-    // --- Artifact Extraction ---
-    const titleArtifact = step.artifacts?.find(a => a.label.includes('Selected Title') || a.label.includes('Hook'));
-    const scriptArtifact = step.artifacts?.find(a => a.label.includes('Script') && a.type === 'text');
-    const imageArtifacts = step.artifacts?.filter(a => a.type === 'image') || [];
-    const audioArtifact = step.artifacts?.find(a => a.type === 'audio');
-    const mixArtifact = step.artifacts?.find(a => a.type === 'mix_config');
-    const mixData = mixArtifact && mixArtifact.content ? JSON.parse(mixArtifact.content) : null;
+    // --- Load Artifacts into Local State for Editing ---
+    useEffect(() => {
+        if (step.agentRole === 'ScriptBuilder') {
+            const scriptArt = step.artifacts?.find(a => a.label.includes('Script'));
+            if (scriptArt) setLocalScript(scriptArt.content || '');
+        }
+        if (step.agentRole === 'VisualProducer') {
+            const scenesArt = step.artifacts?.find(a => a.label.includes('JSON'));
+            if (scenesArt) {
+                try {
+                    setLocalScenes(JSON.parse(scenesArt.content || '[]'));
+                } catch(e) {}
+            }
+        }
+        if (step.agentRole === 'MusicDirector') {
+            const mixArt = step.artifacts?.find(a => a.type === 'mix_config');
+            if (mixArt) {
+                try {
+                    setLocalMix(JSON.parse(mixArt.content || '{}'));
+                } catch(e) {}
+            }
+        }
+        // Check for server-side video
+        const videoArt = step.artifacts?.find(a => a.type === 'video');
+        if (videoArt && !finalVideoUrl) setFinalVideoUrl(videoArt.url || null);
+
+    }, [step]);
+
+    // --- Actions ---
+
+    const handleSaveEdit = () => {
+        const updatedArtifacts = [...(step.artifacts || [])];
+
+        if (step.agentRole === 'ScriptBuilder') {
+            const idx = updatedArtifacts.findIndex(a => a.label.includes('Script'));
+            if (idx >= 0) updatedArtifacts[idx] = { ...updatedArtifacts[idx], content: localScript };
+        }
+        else if (step.agentRole === 'VisualProducer') {
+            const idx = updatedArtifacts.findIndex(a => a.label.includes('JSON'));
+            // Update the JSON artifact
+            if (idx >= 0) updatedArtifacts[idx] = { ...updatedArtifacts[idx], content: JSON.stringify(localScenes) };
+            
+            // Also update individual image artifacts for the grid display logic
+            localScenes.forEach((scene, i) => {
+                const imgIdx = updatedArtifacts.findIndex(a => a.label === `Scene ${i+1}`);
+                if (imgIdx >= 0 && scene.generatedImageUrl) {
+                    updatedArtifacts[imgIdx] = { ...updatedArtifacts[imgIdx], url: scene.generatedImageUrl };
+                }
+            });
+        }
+        else if (step.agentRole === 'MusicDirector') {
+            const idx = updatedArtifacts.findIndex(a => a.type === 'mix_config');
+            if (idx >= 0) updatedArtifacts[idx] = { ...updatedArtifacts[idx], content: JSON.stringify(localMix) };
+        }
+
+        onUpdateStep({ ...step, artifacts: updatedArtifacts });
+        setIsEditing(false);
+        toast.success("تم حفظ التعديلات بنجاح");
+    };
+
+    const handleRegenerateTTS = async (sceneIndex: number, text: string) => {
+        setRegeneratingAudio(sceneIndex);
+        try {
+            const blob = await generateSpeech(text, 'Kore'); 
+            const url = URL.createObjectURL(blob);
+            
+            const updatedScenes = [...localScenes];
+            updatedScenes[sceneIndex] = { 
+                ...updatedScenes[sceneIndex], 
+                generatedAudioUrl: url,
+                generatedAudioBlob: blob 
+            };
+            setLocalScenes(updatedScenes);
+            toast.success("تم تحديث الصوت للمشهد");
+        } catch (e: any) {
+            toast.error("فشل توليد الصوت: " + e.message);
+        } finally {
+            setRegeneratingAudio(null);
+        }
+    };
 
     // --- RENDER LOGIC FOR ASSEMBLER ---
     const handleRender = async () => {
         setRendering(true);
         try {
-            // 1. Gather Assets from previous steps
-            const visualsStep = job.steps.find(s => s.agentRole === 'VisualProducer');
-            const voiceStep = job.steps.find(s => s.agentRole === 'VoiceDirector');
-            const musicStep = job.steps.find(s => s.agentRole === 'MusicDirector');
+            let scenesToRender = [];
+            
+            if (step.agentRole === 'VisualProducer') {
+                scenesToRender = localScenes;
+            } else {
+                const visualsStep = job.steps.find(s => s.agentRole === 'VisualProducer');
+                const scenesArtifact = visualsStep?.artifacts?.find(a => a.label.includes('JSON'));
+                scenesToRender = scenesArtifact ? JSON.parse(scenesArtifact.content || '[]') : [];
+            }
 
-            // Parse Scenes
-            const scenesArtifact = visualsStep?.artifacts?.find(a => a.label.includes('JSON'));
-            const scenes = scenesArtifact ? JSON.parse(scenesArtifact.content || '[]') : [];
+            let musicUrl = null;
+            let ducking = -15;
+            if (step.agentRole === 'MusicDirector') {
+                musicUrl = localMix?.trackUrl;
+            } else {
+                const musicStep = job.steps.find(s => s.agentRole === 'MusicDirector');
+                const musicConfig = musicStep?.artifacts?.find(a => a.type === 'mix_config');
+                const mData = musicConfig ? JSON.parse(musicConfig.content || '{}') : {};
+                musicUrl = mData.trackUrl;
+            }
 
-            // Get Audio URLs
-            const voiceUrl = voiceStep?.artifacts?.find(a => a.type === 'audio')?.url;
-            const musicConfig = musicStep?.artifacts?.find(a => a.type === 'mix_config');
-            const musicUrl = musicConfig && musicConfig.content ? JSON.parse(musicConfig.content).trackUrl : null;
+            const globalVoiceUrl = undefined; 
 
-            if (scenes.length === 0) throw new Error("No scenes found to render");
+            if (scenesToRender.length === 0) throw new Error("No scenes found to render");
 
-            // 2. Call Assembler
             const blob = await assembleVideo(
-                scenes,
+                scenesToRender,
                 job.type === 'Shorts' ? '9:16' : '16:9',
-                voiceUrl,
+                globalVoiceUrl,
                 musicUrl,
-                -15 // Ducking level
+                ducking
             );
 
-            // 3. Show Result
             const url = URL.createObjectURL(blob);
             setFinalVideoUrl(url);
+            toast.success("تم بناء الفيديو بنجاح!");
 
         } catch (e: any) {
-            alert("Rendering Failed: " + e.message);
+            toast.error("فشل بناء الفيديو: " + e.message);
             console.error(e);
         } finally {
             setRendering(false);
         }
     };
 
+    // ... (Rest of component remains largely same, just simpler logs)
+    // --- Artifact Extraction ---
+    const titleArtifact = step.artifacts?.find(a => a.label.includes('Selected Title') || a.label.includes('Hook'));
+    const scriptArtifact = step.artifacts?.find(a => a.label.includes('Script') && a.type === 'text');
+    const imageArtifacts = step.artifacts?.filter(a => a.type === 'image') || [];
+    const audioArtifact = step.artifacts?.find(a => a.type === 'audio');
+    const mixArtifact = step.artifacts?.find(a => a.type === 'mix_config');
+    const videoArtifact = step.artifacts?.find(a => a.type === 'video');
+    const mixData = mixArtifact && mixArtifact.content ? JSON.parse(mixArtifact.content) : null;
+
+    const displayVideoUrl = finalVideoUrl || videoArtifact?.url;
+
     return (
         <div className={`relative bg-slate-900 border rounded-xl p-6 mb-6 transition-all duration-300 group ${
             isActive ? 'border-blue-500 shadow-[0_0_20px_rgba(59,130,246,0.15)] ring-1 ring-blue-500/30' : 
+            isEditing ? 'border-blue-500 ring-1 ring-blue-500' :
             isDone ? 'border-slate-800 opacity-100 hover:border-slate-700' : 'border-slate-800 opacity-60'
         }`}>
             {/* Header Section */}
             <div className="flex justify-between items-start mb-4">
                 <div className="flex items-center gap-4">
-                    {/* Status Icon */}
                     <div className={`w-10 h-10 rounded-full border-2 flex items-center justify-center shrink-0 ${
                         isDone ? 'border-green-500 bg-green-500/10 text-green-500' :
                         isActive ? 'border-blue-500 bg-blue-500/10 text-blue-500 animate-pulse' :
@@ -99,121 +206,252 @@ const StepCard: React.FC<StepCardProps> = ({ step, index, job }) => {
                         </h3>
                         <p className="text-[10px] text-slate-500 font-mono uppercase tracking-widest flex items-center gap-2">
                             {step.agentRole.replace('Director', '').replace('Builder', '').replace('Producer', '')} AGENT
-                            {step.tokenUsage && <span className="text-amber-600">• {step.tokenUsage.total} tokens</span>}
                         </p>
                     </div>
                 </div>
+
+                {isDone && !isEditing && step.agentRole !== 'EditorAssembler' && (
+                    <button onClick={() => setIsEditing(true)} className="p-2 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-white transition">
+                        <Edit3 size={16} />
+                    </button>
+                )}
             </div>
 
-            {/* --- RICH CONTENT AREA (THE ARTIFACTS) --- */}
+            {/* --- RICH CONTENT & EDITORS --- */}
             
-            {/* 1. TITLE / HOOK DISPLAY */}
-            {titleArtifact && (
-                <div className="mt-2 bg-gradient-to-r from-blue-900/20 to-transparent border-r-4 border-blue-500 p-4 rounded-l-lg animate-in fade-in slide-in-from-right-4">
-                    <div className="text-[10px] text-blue-400 uppercase font-bold mb-1">العنوان المختار (Title/Hook)</div>
-                    <div className="text-xl font-bold text-white leading-tight">
-                        "{titleArtifact.content}"
-                    </div>
+            {/* 1. TITLE DISPLAY */}
+            {titleArtifact && !isEditing && (
+                <div className="mt-2 bg-gradient-to-r from-blue-900/20 to-transparent border-r-4 border-blue-500 p-4 rounded-l-lg">
+                    <div className="text-[10px] text-blue-400 uppercase font-bold mb-1">العنوان المختار</div>
+                    <div className="text-xl font-bold text-white leading-tight">"{titleArtifact.content}"</div>
                 </div>
             )}
 
-            {/* 2. SCRIPT DISPLAY */}
+            {/* 2. SCRIPT EDITOR */}
             {scriptArtifact && (
-                <div className="mt-4 animate-in fade-in slide-in-from-bottom-2">
+                <div className="mt-4">
                     <div className="flex items-center gap-2 text-xs text-slate-400 mb-2">
                         <FileText size={14} className="text-slate-500" />
-                        <span className="font-bold">النص المولد (Generated Script)</span>
+                        <span className="font-bold">السكربت (Script)</span>
                     </div>
-                    <div className="bg-slate-950/50 border border-slate-800 rounded-lg p-4 text-sm text-slate-300 font-serif leading-relaxed whitespace-pre-wrap max-h-48 overflow-y-auto custom-scrollbar shadow-inner text-right" dir="rtl">
-                        {scriptArtifact.content}
-                    </div>
+                    {isEditing ? (
+                        <div className="space-y-3">
+                            <textarea 
+                                value={localScript}
+                                onChange={(e) => setLocalScript(e.target.value)}
+                                className="w-full h-64 bg-slate-950 border border-blue-500/50 rounded-lg p-4 text-sm text-slate-200 font-mono leading-relaxed focus:outline-none"
+                                dir="rtl"
+                            />
+                            <div className="flex justify-end gap-2">
+                                <button onClick={() => setIsEditing(false)} className="px-4 py-2 text-slate-400 hover:text-white">إلغاء</button>
+                                <button onClick={handleSaveEdit} className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg flex items-center gap-2">
+                                    <Save size={16} /> حفظ التعديلات
+                                </button>
+                            </div>
+                        </div>
+                    ) : (
+                        <div className="bg-slate-950/50 border border-slate-800 rounded-lg p-4 text-sm text-slate-300 font-serif leading-relaxed whitespace-pre-wrap max-h-48 overflow-y-auto custom-scrollbar shadow-inner text-right" dir="rtl">
+                            {scriptArtifact.content}
+                        </div>
+                    )}
                 </div>
             )}
 
-            {/* 3. VISUALS (IMAGES GRID) */}
-            {imageArtifacts.length > 0 && (
-                <div className="mt-4 animate-in fade-in slide-in-from-bottom-2">
-                    <div className="flex items-center gap-2 text-xs text-slate-400 mb-2">
-                        <ImageIcon size={14} className="text-pink-500" />
-                        <span className="font-bold">المشاهد المولدة (Generated Scenes)</span>
+            {/* 3. VISUAL & SCENE EDITOR */}
+            {(step.agentRole === 'VisualProducer' || imageArtifacts.length > 0) && (
+                <div className="mt-4">
+                    <div className="flex items-center justify-between mb-3">
+                        <div className="flex items-center gap-2 text-xs text-slate-400">
+                            <ImageIcon size={14} className="text-pink-500" />
+                            <span className="font-bold">المشاهد ({localScenes.length})</span>
+                        </div>
                     </div>
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                        {imageArtifacts.map((img, i) => (
-                            <div key={i} className="group relative aspect-video bg-black rounded-lg overflow-hidden border border-slate-700">
-                                <img src={img.url} alt={`Scene ${i}`} className="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition duration-500 hover:scale-110" />
-                                <div className="absolute bottom-0 left-0 right-0 bg-black/60 text-[9px] text-white p-1 text-center backdrop-blur-sm">
-                                    Scene {i + 1}
+
+                    {isEditing ? (
+                        <div className="space-y-4">
+                            {localScenes.map((scene, idx) => (
+                                <div key={idx} className="bg-slate-950 border border-slate-700 rounded-xl p-4 flex flex-col md:flex-row gap-4 animate-in fade-in">
+                                    <div className="w-full md:w-48 shrink-0">
+                                        {scene.generatedImageUrl ? (
+                                            <div className="aspect-video bg-black rounded-lg overflow-hidden border border-slate-800 relative group">
+                                                <img src={scene.generatedImageUrl} className="w-full h-full object-cover" />
+                                                <div className="absolute inset-0 bg-black/60 flex items-center justify-center opacity-0 group-hover:opacity-100 transition">
+                                                    <span className="text-[10px] text-white">Scene {idx+1}</span>
+                                                </div>
+                                            </div>
+                                        ) : (
+                                            <div className="aspect-video bg-slate-900 rounded-lg flex items-center justify-center text-slate-600 text-xs">No Image</div>
+                                        )}
+                                        <div className="mt-2">
+                                            <label className="text-[10px] text-slate-500 block">Image URL</label>
+                                            <input 
+                                                value={scene.generatedImageUrl || ''}
+                                                onChange={(e) => {
+                                                    const updated = [...localScenes];
+                                                    updated[idx].generatedImageUrl = e.target.value;
+                                                    setLocalScenes(updated);
+                                                }}
+                                                className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-[10px] text-slate-300"
+                                            />
+                                        </div>
+                                    </div>
+
+                                    <div className="flex-1 space-y-3">
+                                        <div className="flex gap-4">
+                                            <div className="flex-1">
+                                                <label className="text-[10px] text-slate-500 block mb-1">Narration Text</label>
+                                                <textarea 
+                                                    value={scene.narration_text}
+                                                    onChange={(e) => {
+                                                        const updated = [...localScenes];
+                                                        updated[idx].narration_text = e.target.value;
+                                                        setLocalScenes(updated);
+                                                    }}
+                                                    className="w-full h-16 bg-slate-900 border border-slate-700 rounded p-2 text-xs text-white text-right"
+                                                    dir="rtl"
+                                                />
+                                            </div>
+                                            <div className="w-24">
+                                                <label className="text-[10px] text-slate-500 block mb-1">Duration (s)</label>
+                                                <input 
+                                                    type="number"
+                                                    value={scene.duration_seconds}
+                                                    onChange={(e) => {
+                                                        const updated = [...localScenes];
+                                                        updated[idx].duration_seconds = parseFloat(e.target.value);
+                                                        setLocalScenes(updated);
+                                                    }}
+                                                    className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-xs text-white text-center"
+                                                />
+                                            </div>
+                                        </div>
+
+                                        <div className="flex items-center gap-3 border-t border-slate-800 pt-2">
+                                            <button 
+                                                onClick={() => handleRegenerateTTS(idx, scene.narration_text || '')}
+                                                className="flex items-center gap-2 text-xs text-blue-400 hover:text-blue-300 transition"
+                                                disabled={regeneratingAudio === idx}
+                                            >
+                                                {regeneratingAudio === idx ? <Loader2 size={12} className="animate-spin"/> : <Mic2 size={12} />}
+                                                تحديث الصوت
+                                            </button>
+                                            
+                                            {scene.generatedAudioUrl && (
+                                                <div className="flex items-center gap-2">
+                                                    <audio controls src={scene.generatedAudioUrl} className="h-6 w-32 opacity-70" />
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                </div>
+                            ))}
+                            
+                            <div className="flex justify-between items-center pt-4 border-t border-slate-800">
+                                <button className="text-xs text-slate-500 flex items-center gap-1 hover:text-white" onClick={() => {
+                                    setLocalScenes([...localScenes, { scene_id: `new_${Date.now()}`, duration_seconds: 5, visual_prompt: 'New Scene', objective: '', mood: '', shot_type: '', narration_text: '' }]);
+                                }}><Plus size={14}/> Add Scene</button>
+                                <div className="flex gap-2">
+                                    <button onClick={() => setIsEditing(false)} className="px-4 py-2 text-slate-400 hover:text-white">إلغاء</button>
+                                    <button onClick={handleSaveEdit} className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg flex items-center gap-2">
+                                        <Save size={16} /> حفظ المشاهد
+                                    </button>
                                 </div>
                             </div>
-                        ))}
-                    </div>
+                        </div>
+                    ) : (
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                            {imageArtifacts.map((img, i) => (
+                                <div key={i} className="group relative aspect-video bg-black rounded-lg overflow-hidden border border-slate-700">
+                                    <img src={img.url} alt={`Scene ${i}`} className="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition duration-500 hover:scale-110" />
+                                    <div className="absolute bottom-0 left-0 right-0 bg-black/60 text-[9px] text-white p-1 text-center backdrop-blur-sm">
+                                        Scene {i + 1}
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
                 </div>
             )}
 
-            {/* 4. VOICE / AUDIO PLAYER */}
-            {audioArtifact && (
-                <div className="mt-4 bg-slate-950 border border-slate-800 rounded-xl p-3 flex items-center gap-4 animate-in fade-in">
-                    <div className="w-10 h-10 bg-amber-500/10 rounded-full flex items-center justify-center text-amber-500 shrink-0">
-                        <Mic2 size={20} />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                        <div className="text-[10px] text-slate-500 font-bold uppercase mb-1">التعليق الصوتي (Voiceover)</div>
-                        <audio controls src={audioArtifact.url} className="w-full h-8 opacity-80 hover:opacity-100 transition" />
-                    </div>
-                </div>
-            )}
-
-            {/* 5. MUSIC MIXING DISPLAY */}
+            {/* 4. AUDIO / MUSIC EDITOR */}
             {mixData && (
-                <div className="mt-4 bg-purple-900/10 border border-purple-900/30 rounded-lg p-4 animate-in fade-in">
-                    <div className="flex justify-between items-center mb-3 border-b border-purple-900/30 pb-2">
-                        <div className="flex items-center gap-2">
-                            <Music size={16} className="text-purple-400" />
-                            <span className="text-xs font-bold text-purple-300">الموسيقى المختارة (Backing Track)</span>
+                <div className="mt-4">
+                    {isEditing ? (
+                        <div className="bg-purple-900/10 border border-purple-900/30 rounded-lg p-4 space-y-4">
+                            {/* ... (Same Editor UI) ... */}
+                            <div className="flex justify-end gap-2 pt-2">
+                                <button onClick={() => setIsEditing(false)} className="px-3 py-1 text-xs text-slate-400 hover:text-white">إلغاء</button>
+                                <button onClick={handleSaveEdit} className="px-3 py-1 bg-purple-600 hover:bg-purple-500 text-white rounded text-xs">حفظ</button>
+                            </div>
                         </div>
-                        <span className="text-[10px] text-white bg-purple-900/50 px-2 py-0.5 rounded">{mixData.bpm} BPM</span>
-                    </div>
-                    <div className="flex justify-between items-end">
-                        <div>
-                            <div className="text-sm text-white font-bold">{mixData.track}</div>
-                            <div className="text-xs text-slate-400 mt-0.5">{mixData.mood}</div>
+                    ) : (
+                        <div className="bg-purple-900/10 border border-purple-900/30 rounded-lg p-4 animate-in fade-in">
+                            <div className="flex justify-between items-center mb-3 border-b border-purple-900/30 pb-2">
+                                <div className="flex items-center gap-2">
+                                    <Music size={16} className="text-purple-400" />
+                                    <span className="text-xs font-bold text-purple-300">الموسيقى المختارة</span>
+                                </div>
+                                <span className="text-[10px] text-white bg-purple-900/50 px-2 py-0.5 rounded">{mixData.bpm} BPM</span>
+                            </div>
+                            <div className="flex justify-between items-end">
+                                <div>
+                                    <div className="text-sm text-white font-bold">{mixData.track}</div>
+                                    <div className="text-xs text-slate-400 mt-0.5">{mixData.mood}</div>
+                                </div>
+                                <div className="flex gap-2 text-[10px] text-slate-500 font-mono">
+                                    <span className="bg-slate-900 px-2 py-1 rounded">Ducking: {mixData.mix.ducking}</span>
+                                    <span className="bg-slate-900 px-2 py-1 rounded">Vol: {mixData.mix.music_volume_db || '-18'}dB</span>
+                                </div>
+                            </div>
                         </div>
-                        <div className="flex gap-2 text-[10px] text-slate-500 font-mono">
-                            <span className="bg-slate-900 px-2 py-1 rounded">Ducking: {mixData.mix.ducking}</span>
-                            <span className="bg-slate-900 px-2 py-1 rounded">Vol: {mixData.mix.music_volume_db || '-18'}dB</span>
-                        </div>
-                    </div>
+                    )}
                 </div>
             )}
 
-            {/* 6. ASSEMBLY / FINAL VIDEO */}
+            {/* 6. ASSEMBLY / FINAL VIDEO / RE-RENDER */}
             {step.agentRole === 'EditorAssembler' && isDone && (
                 <div className="mt-6 border-t border-slate-800 pt-4 animate-in fade-in slide-in-from-bottom-4">
-                    <div className="flex items-center gap-2 text-xs text-slate-400 mb-3">
-                        <Film size={14} className="text-red-500" />
-                        <span className="font-bold">الدمج النهائي (Final Assembly)</span>
+                    <div className="flex items-center justify-between mb-3">
+                        <div className="flex items-center gap-2 text-xs text-slate-400">
+                            <Film size={14} className="text-red-500" />
+                            <span className="font-bold">الدمج النهائي (Final Assembly)</span>
+                        </div>
+                        {displayVideoUrl && (
+                            <button 
+                                onClick={handleRender} 
+                                disabled={rendering}
+                                className="flex items-center gap-1 text-[10px] bg-slate-800 hover:bg-blue-600 text-slate-300 hover:text-white px-2 py-1 rounded transition"
+                            >
+                                <RefreshCw size={10} className={rendering ? "animate-spin" : ""} />
+                                إعادة البناء (Re-Render)
+                            </button>
+                        )}
                     </div>
                     
-                    {!finalVideoUrl ? (
+                    {!displayVideoUrl || rendering ? (
                         <button 
                             onClick={handleRender} 
                             disabled={rendering}
                             className="w-full bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 py-4 rounded-xl font-bold flex items-center justify-center gap-3 transition shadow-lg group-hover:shadow-blue-900/10"
                         >
                             {rendering ? <Loader2 className="animate-spin text-blue-500" /> : <Play fill="currentColor" className="text-blue-500" />}
-                            <span>بناء ومعاينة الفيديو (Render Video)</span>
+                            <span>{rendering ? 'جاري بناء الفيديو...' : 'بناء ومعاينة الفيديو (Render Video)'}</span>
                         </button>
                     ) : (
-                        <div className="space-y-3">
-                            <div className="rounded-xl overflow-hidden border border-slate-700 bg-black shadow-2xl">
-                                <video src={finalVideoUrl} controls autoPlay className="w-full max-h-[400px]" />
+                        <div className="space-y-3 animate-in fade-in zoom-in-95 duration-500">
+                            <div className="rounded-xl overflow-hidden border border-slate-700 bg-black shadow-2xl relative group">
+                                <video 
+                                    src={displayVideoUrl} 
+                                    controls 
+                                    className="w-full max-h-[400px]" 
+                                />
                             </div>
                             <div className="flex justify-between items-center">
                                 <span className="text-xs text-green-500 font-mono flex items-center gap-1">
                                     <CheckCircle2 size={12} /> Render Complete
                                 </span>
                                 <a 
-                                    href={finalVideoUrl} 
+                                    href={displayVideoUrl} 
                                     download={`video_${job.id}.webm`}
                                     className="flex items-center gap-2 text-xs bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg transition"
                                 >
@@ -226,7 +464,7 @@ const StepCard: React.FC<StepCardProps> = ({ step, index, job }) => {
             )}
             
             {/* Fallback Summary */}
-            {!titleArtifact && !scriptArtifact && imageArtifacts.length === 0 && !audioArtifact && !mixData && !finalVideoUrl && step.outputSummary && step.agentRole !== 'EditorAssembler' && (
+            {!titleArtifact && !scriptArtifact && imageArtifacts.length === 0 && !audioArtifact && !mixData && !displayVideoUrl && step.outputSummary && step.agentRole !== 'EditorAssembler' && (
                 <div className="mt-3 text-xs text-slate-400 bg-slate-950/50 p-2 rounded border border-slate-800/50 inline-block">
                     {step.outputSummary}
                 </div>
@@ -235,7 +473,11 @@ const StepCard: React.FC<StepCardProps> = ({ step, index, job }) => {
     );
 };
 
-const Production: React.FC = () => {
+interface ProductionProps {
+    initialJobId?: string | null;
+}
+
+const Production: React.FC<ProductionProps> = ({ initialJobId }) => {
   const [channels, setChannels] = useState<Channel[]>([]);
   const [selectedJob, setSelectedJob] = useState<ProductionJob | null>(null);
   const [isRequesting, setIsRequesting] = useState(false);
@@ -265,27 +507,42 @@ const Production: React.FC = () => {
       };
       init();
 
-      // Poll for active job
       const poll = async () => {
           try {
-              const response = await fetch('/api/jobs');
-              if (response.ok) {
-                  const data = await response.json();
-                  if (data.length > 0) {
-                      const latest = data.sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
-                      setSelectedJob(latest);
+              if (initialJobId) {
+                  const response = await fetch(`/api/jobs/${initialJobId}`);
+                  if (response.ok) {
+                      const job = await response.json();
+                      setSelectedJob(job);
+                  }
+              } else {
+                  const response = await fetch('/api/jobs');
+                  if (response.ok) {
+                      const data = await response.json();
+                      if (data.length > 0) {
+                          const sorted = data.sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+                          if (!selectedJob) setSelectedJob(sorted[0]);
+                      }
                   }
               }
           } catch (e) { console.error(e); }
       };
+      
       poll();
-      const interval = setInterval(poll, 2000);
-      return () => clearInterval(interval);
-  }, []);
+  }, [initialJobId]); 
+
+  // Handle local state update from StepCards
+  const handleUpdateJobStep = (updatedStep: ProductionStep) => {
+      if (selectedJob) {
+          const newSteps = selectedJob.steps.map(s => s.id === updatedStep.id ? updatedStep : s);
+          const newJob = { ...selectedJob, steps: newSteps };
+          setSelectedJob(newJob);
+      }
+  };
 
   const handleStartRun = async (overrideTopic?: string) => {
       const finalTopic = overrideTopic || topic;
-      if (!finalTopic) return alert("Please enter a topic");
+      if (!finalTopic) return toast.warning("الرجاء إدخال الموضوع (Topic)");
       
       setIsRequesting(true);
       const payload: Partial<ProductionJob> = {
@@ -313,10 +570,28 @@ const Production: React.FC = () => {
       };
 
       try {
-          await server.startJob(payload);
+          const id = await server.startJob(payload);
           setTopic('');
+          toast.success("تم بدء المهمة بنجاح 🚀");
+          // Force fetch the new job
+          const response = await fetch(`/api/jobs/${id}`);
+          if (response.ok) setSelectedJob(await response.json());
       } catch (e: any) {
-          alert("Error: " + e.message);
+          toast.error("خطأ في بدء المهمة: " + e.message);
+      } finally {
+          setIsRequesting(false);
+      }
+  };
+
+  const handleSimulatedRun = async () => {
+      setIsRequesting(true);
+      try {
+          const id = await server.triggerSmokeTest();
+          toast.success("تم بدء المحاكاة التجريبية (Simulation Started)");
+          const response = await fetch(`/api/jobs/${id}`);
+          if (response.ok) setSelectedJob(await response.json());
+      } catch (e: any) {
+          toast.error("خطأ في المحاكاة: " + e.message);
       } finally {
           setIsRequesting(false);
       }
@@ -478,7 +753,7 @@ const Production: React.FC = () => {
                 </div>
 
                 {/* Actions */}
-                <div className="pt-6 mt-auto">
+                <div className="pt-6 mt-auto space-y-3">
                     <button 
                         onClick={() => handleStartRun()}
                         disabled={isRequesting}
@@ -486,6 +761,15 @@ const Production: React.FC = () => {
                     >
                         {isRequesting ? <Loader2 className="animate-spin" /> : <Play fill="currentColor" />}
                         Start Production Run ▷
+                    </button>
+                    
+                    <button 
+                        onClick={handleSimulatedRun}
+                        disabled={isRequesting}
+                        className="w-full bg-slate-800 hover:bg-slate-700 text-slate-300 py-3 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition disabled:opacity-50 border border-slate-700 border-dashed"
+                    >
+                        <FlaskConical size={14} />
+                        تشغيل تجريبي (Simulation)
                     </button>
                 </div>
             </div>
@@ -504,8 +788,8 @@ const Production: React.FC = () => {
                         </div>
                         <div className="flex items-center gap-4">
                             <div className="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-full border border-blue-900/30">
-                                <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></span>
-                                <span className="text-xs text-blue-400 font-bold">Processing on Server</span>
+                                <span className={`w-2 h-2 rounded-full ${selectedJob.status === JobStatus.RUNNING ? 'bg-blue-500 animate-pulse' : 'bg-green-500'}`}></span>
+                                <span className="text-xs text-blue-400 font-bold">{selectedJob.status === JobStatus.RUNNING ? 'Processing' : 'Active View'}</span>
                             </div>
                             <div className="flex items-center gap-2 text-slate-500 text-xs font-mono">
                                 <Clock size={14} />
@@ -526,7 +810,13 @@ const Production: React.FC = () => {
 
                             {/* Steps */}
                             {selectedJob.steps.map((step, idx) => (
-                                <StepCard key={step.id} step={step} index={idx} job={selectedJob} />
+                                <StepCard 
+                                    key={step.id} 
+                                    step={step} 
+                                    index={idx} 
+                                    job={selectedJob} 
+                                    onUpdateStep={handleUpdateJobStep}
+                                />
                             ))}
                             
                         </div>
